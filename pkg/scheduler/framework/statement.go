@@ -1,0 +1,503 @@
+/*
+Copyright 2018 The Kubernetes Authors.
+Copyright 2018-2025 The Volcano Authors.
+
+Modifications made by Volcano authors:
+- Added comprehensive operation management with save/recover capabilities
+- Enhanced with Allocate/UnAllocate and UnPipeline operations
+- Added improved error handling and rollback support
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package framework
+
+import (
+	"errors"
+	"fmt"
+
+	"k8s.io/klog/v2"
+
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/metrics"
+)
+
+// Operation type
+type Operation int8
+
+const (
+	// Evict op
+	Evict = iota
+	// Pipeline op
+	Pipeline
+	// Allocate op
+	Allocate
+)
+
+type operation struct {
+	name   Operation
+	task   *api.TaskInfo
+	reason string
+}
+
+// Statement structure
+type Statement struct {
+	operations []operation
+	ssn        *Session
+}
+
+// NewStatement returns new statement object
+func NewStatement(ssn *Session) *Statement {
+	return &Statement{
+		ssn: ssn,
+	}
+}
+
+// AddOperation adds operation to statement
+func (s *Statement) Operations() []operation {
+	return s.operations
+}
+
+// HasEvictions returns whether the statement contains at least one eviction operation.
+func (s *Statement) HasEvictions() bool {
+	for _, op := range s.operations {
+		if op.name == Evict {
+			return true
+		}
+	}
+	return false
+}
+
+// Evict the pod
+func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) {
+	// Update status in session
+	if job, found := s.ssn.Jobs[reclaimee.Job]; found {
+		job.UpdateTaskStatus(reclaimee, api.Releasing)
+	} else {
+		klog.Errorf("Failed to find Job <%s> in Session <%s> index when evicting.",
+			reclaimee.Job, s.ssn.UID)
+	}
+
+	// Update task in node.
+	if node, found := s.ssn.Nodes[reclaimee.NodeName]; found {
+		node.UpdateTask(reclaimee)
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.DeallocateFunc != nil {
+			eventInfo := &Event{
+				Task: reclaimee,
+			}
+			eh.DeallocateFunc(eventInfo)
+		}
+	}
+
+	s.operations = append(s.operations, operation{
+		name:   Evict,
+		task:   reclaimee,
+		reason: reason,
+	})
+}
+
+func (s *Statement) evict(reclaimee *api.TaskInfo, reason string) error {
+	if err := s.ssn.cache.Evict(reclaimee, reason); err != nil {
+		if e := s.unevict(reclaimee); e != nil {
+			klog.Errorf("Faled to unevict task <%v/%v>: %v.", reclaimee.Namespace, reclaimee.Name, e)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (s *Statement) unevict(reclaimee *api.TaskInfo) error {
+	// Update status in session
+	job, found := s.ssn.Jobs[reclaimee.Job]
+	if found {
+		job.UpdateTaskStatus(reclaimee, api.Running)
+	} else {
+		klog.Errorf("Failed to find Job <%s> in Session <%s> index when unevicting.",
+			reclaimee.Job, s.ssn.UID)
+	}
+
+	// Update task in node.
+	if node, found := s.ssn.Nodes[reclaimee.NodeName]; found {
+		node.UpdateTask(reclaimee)
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.AllocateFunc != nil {
+			eh.AllocateFunc(&Event{
+				Task:    reclaimee,
+				Restore: true,
+			})
+		}
+	}
+
+	return nil
+}
+
+// Pipeline the task for the node
+func (s *Statement) Pipeline(task *api.TaskInfo, hostname string, evictionOccurred bool) (err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+		if rollbackErr := s.unPipeline(task); rollbackErr != nil {
+			klog.Errorf("Failed to rollback pipeline for task <%v/%v> on node <%v> in Session <%v>: %v",
+				task.Namespace, task.Name, hostname, s.ssn.UID, rollbackErr)
+		}
+	}()
+
+	errInfos := make([]error, 0)
+	job, found := s.ssn.Jobs[task.Job]
+	if found {
+		job.UpdateTaskStatus(task, api.Pipelined)
+	} else {
+		err := fmt.Errorf("Failed to find Job <%s> in Session <%s> index when pipeline.",
+			task.Job, s.ssn.UID)
+		klog.Errorf("%v", err)
+		errInfos = append(errInfos, err)
+	}
+
+	task.NodeName = hostname
+	task.EvictionOccurred = evictionOccurred
+
+	if node, found := s.ssn.Nodes[hostname]; found {
+		if err := node.AddTask(task); err != nil {
+			klog.Errorf("Failed to add task <%v/%v> to node <%v> when pipeline in Session <%v>: %v",
+				task.Namespace, task.Name, hostname, s.ssn.UID, err)
+			errInfos = append(errInfos, err)
+		}
+		klog.V(3).Infof("After pipelined Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
+			task.Namespace, task.Name, node.Name, node.Idle, node.Used, node.Releasing)
+	} else {
+		err := fmt.Errorf("Failed to find Node <%s> in Session <%s> index when pipeline.",
+			hostname, s.ssn.UID)
+		klog.Errorf("%v", err)
+		errInfos = append(errInfos, err)
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.AllocateFunc != nil {
+			eventInfo := &Event{
+				Task: task,
+			}
+			eh.AllocateFunc(eventInfo)
+			if eventInfo.Err != nil {
+				klog.Errorf("Failed to exec allocate callback functions for task <%v/%v> to node <%v> when pipeline in Session <%v>: %v",
+					task.Namespace, task.Name, hostname, s.ssn.UID, eventInfo.Err)
+				errInfos = append(errInfos, eventInfo.Err)
+			}
+		}
+	}
+
+	if len(errInfos) != 0 {
+		return fmt.Errorf("Task(%s/%s) pipeline to node(%s) error and errInfos num is %d, pipeline has been rolled back",
+			task.Namespace, task.Name, hostname, len(errInfos))
+	} else {
+		s.operations = append(s.operations, operation{
+			name: Pipeline,
+			task: task,
+		})
+	}
+
+	return nil
+}
+
+func (s *Statement) pipeline(task *api.TaskInfo) {
+}
+
+func (s *Statement) UnPipeline(task *api.TaskInfo) error {
+	return s.unPipeline(task)
+}
+
+func (s *Statement) unPipeline(task *api.TaskInfo) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if found {
+		job.UpdateTaskStatus(task, api.Pending)
+	} else {
+		klog.Errorf("Failed to find Job <%s> in Session <%s> index when unpipeline.", task.Job, s.ssn.UID)
+	}
+
+	if node, found := s.ssn.Nodes[task.NodeName]; found {
+		node.RemoveTask(task)
+		klog.V(3).Infof("After unpipelined Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
+			task.Namespace, task.Name, node.Name, node.Idle, node.Used, node.Releasing)
+	} else {
+		klog.Errorf("Failed to find Node <%s> in Session <%s> index when unpipeline.",
+			task.NodeName, s.ssn.UID)
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.DeallocateFunc != nil {
+			eventInfo := &Event{
+				Task: task,
+			}
+			eh.DeallocateFunc(eventInfo)
+		}
+	}
+	task.NodeName = ""
+	task.EvictionOccurred = false
+	task.JobAllocatedHyperNode = ""
+
+	return nil
+}
+
+// Allocate the task to node
+func (s *Statement) Allocate(task *api.TaskInfo, nodeInfo *api.NodeInfo) (err error) {
+	defer func() {
+		if err != nil {
+			if rollbackErr := s.unallocate(task); rollbackErr != nil {
+				klog.Errorf("Failed to rollback allocation for Task <%v/%v> on node <%v> in Session <%v>: %v",
+					task.Namespace, task.Name, nodeInfo.Name, s.ssn.UID, rollbackErr)
+			}
+		}
+	}()
+	errInfos := make([]error, 0)
+	hostname := nodeInfo.Name
+	task.Pod.Spec.NodeName = hostname
+
+	// Only update status in session
+	job, found := s.ssn.Jobs[task.Job]
+	if found {
+		job.UpdateTaskStatus(task, api.Allocated)
+	} else {
+		err := fmt.Errorf("Failed to find Job <%s> in Session <%s> index when allocating.",
+			task.Job, s.ssn.UID)
+		klog.Errorf("%v", err)
+		errInfos = append(errInfos, err)
+	}
+
+	task.NodeName = hostname
+	if node, found := s.ssn.Nodes[hostname]; found {
+		if err := node.AddTask(task); err != nil {
+			klog.Errorf("Failed to add task <%v/%v> to node <%v> when allocating in Session <%v>: %v",
+				task.Namespace, task.Name, hostname, s.ssn.UID, err)
+			errInfos = append(errInfos, err)
+		}
+		klog.V(3).Infof("After allocated Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
+			task.Namespace, task.Name, node.Name, node.Idle, node.Used, node.Releasing)
+	} else {
+		err := fmt.Errorf("Failed to find Node <%s> in Session <%s> index when allocating.",
+			hostname, s.ssn.UID)
+		klog.Errorf("%v", err)
+		errInfos = append(errInfos, err)
+	}
+
+	// Callbacks
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.AllocateFunc != nil {
+			eventInfo := &Event{
+				Task: task,
+			}
+			eh.AllocateFunc(eventInfo)
+			if eventInfo.Err != nil {
+				klog.Errorf("Failed to exec allocate callback functions for task <%v/%v> to node <%v> when allocating in Session <%v>: %v",
+					task.Namespace, task.Name, hostname, s.ssn.UID, eventInfo.Err)
+				errInfos = append(errInfos, eventInfo.Err)
+			}
+		}
+	}
+
+	if len(errInfos) != 0 {
+		err = fmt.Errorf("Task %s/%s allocate to node %s error and errInfos num is %d, allocation has been rolled back",
+			task.Namespace, task.Name, hostname, len(errInfos))
+		return
+	} else {
+		// Update status in session
+		klog.V(3).Info("Allocating operations ...")
+		s.operations = append(s.operations, operation{
+			name: Allocate,
+			task: task,
+		})
+	}
+
+	return nil
+}
+
+func (s *Statement) allocate(task *api.TaskInfo) error {
+	bindContext := s.ssn.CreateBindContext(task)
+	if err := s.ssn.cache.AddBindTask(bindContext); err != nil {
+		return err
+	}
+
+	if job, found := s.ssn.Jobs[task.Job]; found {
+		job.UpdateTaskStatus(task, api.Binding)
+	} else {
+		klog.Errorf("Failed to find Job <%s> in Session <%s> index when binding.",
+			task.Job, s.ssn.UID)
+		return fmt.Errorf("failed to find job %s", task.Job)
+	}
+
+	metrics.UpdateTaskScheduleDuration(metrics.TaskStageAssumed, metrics.Duration(task.Pod.CreationTimestamp.Time))
+	return nil
+}
+
+// unallocate the pod for task
+func (s *Statement) unallocate(task *api.TaskInfo) error {
+	// Update status in session
+	job, found := s.ssn.Jobs[task.Job]
+	if found {
+		job.UpdateTaskStatus(task, api.Pending)
+	} else {
+		klog.Errorf("Failed to find Job <%s> in Session <%s> index when unallocating.",
+			task.Job, s.ssn.UID)
+	}
+
+	if node, found := s.ssn.Nodes[task.NodeName]; found {
+		klog.V(3).Infof("Remove Task <%v> on node <%v>", task.Name, task.NodeName)
+		node.RemoveTask(task)
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.DeallocateFunc != nil {
+			eh.DeallocateFunc(&Event{
+				Task: task,
+			})
+		}
+	}
+	task.NodeName = ""
+	task.JobAllocatedHyperNode = ""
+
+	return nil
+}
+
+// Discard operation for evict, pipeline and allocate
+func (s *Statement) Discard() {
+	klog.V(3).Info("Discarding operations ...")
+	for i := len(s.operations) - 1; i >= 0; i-- {
+		op := s.operations[i]
+		op.task.GenerateLastTxContext()
+		switch op.name {
+		case Evict:
+			err := s.unevict(op.task)
+			if err != nil {
+				klog.Errorf("Failed to unevict task: %s", err.Error())
+			}
+		case Pipeline:
+			err := s.unPipeline(op.task)
+			if err != nil {
+				klog.Errorf("Failed to unpipeline task: %s", err.Error())
+			}
+		case Allocate:
+			err := s.unallocate(op.task)
+			if err != nil {
+				klog.Errorf("Failed to unallocate task: %s", err.Error())
+			}
+		}
+	}
+	s.operations = nil
+}
+
+// Commit operation for evict and pipeline
+func (s *Statement) Commit() {
+	klog.V(3).Info("Committing operations ...")
+	for _, op := range s.operations {
+		op.task.ClearLastTxContext()
+		switch op.name {
+		case Evict:
+			err := s.evict(op.task, op.reason)
+			if err != nil {
+				klog.Errorf("Failed to evict task: %s", err.Error())
+			}
+		case Pipeline:
+			s.pipeline(op.task)
+		case Allocate:
+			err := s.allocate(op.task)
+			if err != nil {
+				if e := s.unallocate(op.task); e != nil {
+					klog.Errorf("Failed to unallocate task <%v/%v>: %v.", op.task.Namespace, op.task.Name, e)
+				}
+				klog.Errorf("Failed to allocate task <%v/%v>: %v.", op.task.Namespace, op.task.Name, err)
+			}
+		}
+	}
+	s.operations = nil
+}
+
+// Merge transfers operations from the given statements into this statement.
+// The source statements share the same session, so their in-memory state changes
+// (evictions, pipelines) are already reflected in the session. Merge moves ownership
+// of those operation records so they will be committed or discarded with this statement.
+// After merging, source statements' operations are cleared to prevent double-commit or
+// double-discard.
+func (s *Statement) Merge(stmts ...*Statement) {
+	for _, stmt := range stmts {
+		s.operations = append(s.operations, stmt.operations...)
+		stmt.operations = nil
+	}
+}
+
+func SaveOperations(stmts ...*Statement) *Statement {
+	stmtTmp := &Statement{}
+	for _, stmt := range stmts {
+		stmt.outputOperations("Save operations: ", 4)
+		for _, op := range stmt.operations {
+			task := op.task.Clone()
+			task.EvictionOccurred = op.task.EvictionOccurred
+			stmtTmp.operations = append(stmtTmp.operations, operation{
+				name:   op.name,
+				task:   task,
+				reason: op.reason,
+			})
+		}
+	}
+	return stmtTmp
+}
+
+func (s *Statement) RecoverOperations(stmt *Statement) error {
+	if stmt == nil {
+		return errors.New("statement is nil")
+	}
+	s.outputOperations("Recover operations: ", 4)
+	for _, op := range stmt.operations {
+		switch op.name {
+		case Evict:
+			s.Evict(op.task, op.reason)
+		case Pipeline:
+			err := s.Pipeline(op.task, op.task.NodeName, op.task.EvictionOccurred)
+			if err != nil {
+				klog.Errorf("Failed to pipeline task: %s", err.Error())
+				return err
+			}
+		case Allocate:
+			node := s.ssn.Nodes[op.task.NodeName]
+			err := s.Allocate(op.task, node)
+			if err != nil {
+				klog.Errorf("Failed to allocate task <%v/%v>: %v", op.task.Namespace, op.task.Name, err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Statement) outputOperations(msg string, level klog.Level) {
+	if !klog.V(level).Enabled() {
+		return
+	}
+
+	var buffer string
+	for _, op := range s.operations {
+		switch op.name {
+		case Evict:
+			buffer += fmt.Sprintf("task %s evict from node %s ", op.task.Name, op.task.NodeName)
+		case Pipeline:
+			buffer += fmt.Sprintf("task %s pipeline from node %s ", op.task.Name, op.task.NodeName)
+		case Allocate:
+			buffer += fmt.Sprintf("task %s allocate from node %s ", op.task.Name, op.task.NodeName)
+		}
+	}
+	klog.V(level).Info(msg, buffer)
+}

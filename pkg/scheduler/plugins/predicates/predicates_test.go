@@ -1,0 +1,1267 @@
+/*
+Copyright 2021 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package predicates
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	apiv1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/component-helpers/nodedeclaredfeatures/features/restartallcontainers"
+	k8sframework "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
+	schedframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodedeclaredfeatures"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeports"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeunschedulable"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodevolumelimits"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/podtopologyspread"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumezone"
+
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+
+	volcanofeatures "volcano.sh/volcano/pkg/features"
+	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
+	"volcano.sh/volcano/pkg/scheduler/actions/backfill"
+	"volcano.sh/volcano/pkg/scheduler/actions/preempt"
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
+	"volcano.sh/volcano/pkg/scheduler/cache"
+	"volcano.sh/volcano/pkg/scheduler/conf"
+	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
+	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util/k8s"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util/nodescore"
+	"volcano.sh/volcano/pkg/scheduler/unschedulable"
+	"volcano.sh/volcano/pkg/scheduler/uthelper"
+	"volcano.sh/volcano/pkg/scheduler/util"
+)
+
+type fakeFilterPlugin struct {
+	name    string
+	message string
+}
+
+func (p *fakeFilterPlugin) Name() string {
+	return p.name
+}
+
+func (p *fakeFilterPlugin) Filter(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ k8sframework.NodeInfo) *k8sframework.Status {
+	return k8sframework.NewStatus(k8sframework.Unschedulable, p.message)
+}
+
+type fakeTrackingFilterPlugin struct {
+	name      string
+	callCount int
+}
+
+func (p *fakeTrackingFilterPlugin) Name() string {
+	return p.name
+}
+
+func (p *fakeTrackingFilterPlugin) Filter(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ k8sframework.NodeInfo) *k8sframework.Status {
+	p.callCount++
+	return k8sframework.NewStatus(k8sframework.Success)
+}
+
+type fakeReservePlugin struct {
+	name   string
+	calls  *[]string
+	status *k8sframework.Status
+}
+
+type fakePreScorePlugin struct {
+	name           string
+	preScoreStatus *k8sframework.Status
+	preScoreCalls  int
+}
+
+type fakeScoreOnlyPlugin struct {
+	name  string
+	score int64
+}
+
+func (p *fakePreScorePlugin) Name() string {
+	return p.name
+}
+
+func (p *fakePreScorePlugin) PreScore(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ []k8sframework.NodeInfo) *k8sframework.Status {
+	p.preScoreCalls++
+	return p.preScoreStatus
+}
+
+func (p *fakePreScorePlugin) Score(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ k8sframework.NodeInfo) (int64, *k8sframework.Status) {
+	return 50, k8sframework.NewStatus(k8sframework.Success)
+}
+
+func (p *fakePreScorePlugin) ScoreExtensions() k8sframework.ScoreExtensions {
+	return nil
+}
+
+func (p *fakeScoreOnlyPlugin) Name() string {
+	return p.name
+}
+
+func (p *fakeScoreOnlyPlugin) Score(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ k8sframework.NodeInfo) (int64, *k8sframework.Status) {
+	return p.score, nil
+}
+
+func (p *fakeScoreOnlyPlugin) ScoreExtensions() k8sframework.ScoreExtensions {
+	return nil
+}
+
+func (p *fakeReservePlugin) Name() string {
+	return p.name
+}
+
+func (p *fakeReservePlugin) Reserve(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ string) *k8sframework.Status {
+	*p.calls = append(*p.calls, "reserve-"+p.name)
+	if p.status != nil {
+		return p.status
+	}
+	return k8sframework.NewStatus(k8sframework.Success)
+}
+
+func (p *fakeReservePlugin) Unreserve(_ context.Context, _ k8sframework.CycleState, _ *apiv1.Pod, _ string) {
+	*p.calls = append(*p.calls, "unreserve-"+p.name)
+}
+
+func getWorkerAffinity() *apiv1.Affinity {
+	return &apiv1.Affinity{
+		PodAntiAffinity: &apiv1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{
+								Key:      "role",
+								Operator: "In",
+								Values:   []string{"worker"},
+							},
+						},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		},
+	}
+}
+
+// TestTaskPodAnnotations verifies device allocation annotations flow through
+// TaskInfo's scheduler-owned Pod annotation map.
+func TestTaskPodAnnotations(t *testing.T) {
+	task := &api.TaskInfo{}
+
+	task.MergePodAnnotations(map[string]string{
+		"volcano.sh/vgpu-node":    "node-a",
+		"volcano.sh/vgpu-ids-new": "gpu-a",
+	})
+	got := task.PodAnnotations
+	if got["volcano.sh/vgpu-node"] != "node-a" {
+		t.Fatalf("expected vgpu-node=node-a, got %q", got["volcano.sh/vgpu-node"])
+	}
+
+	task.MergePodAnnotations(map[string]string{
+		"volcano.sh/vgpu-node": "node-b",
+	})
+	got = task.PodAnnotations
+	if got["volcano.sh/vgpu-node"] != "node-b" {
+		t.Fatalf("expected vgpu-node overwritten to node-b, got %q", got["volcano.sh/vgpu-node"])
+	}
+
+	task.DeletePodAnnotations("volcano.sh/vgpu-node")
+	got = task.PodAnnotations
+	if _, ok := got["volcano.sh/vgpu-node"]; ok {
+		t.Fatalf("expected vgpu-node removed")
+	}
+	if got["volcano.sh/vgpu-ids-new"] != "gpu-a" {
+		t.Fatalf("expected unrelated bind annotation preserved")
+	}
+}
+
+func TestEventHandler(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		PluginName:          New,
+		gang.PluginName:     gang.New,
+		priority.PluginName: priority.New,
+	}
+
+	// pending pods
+	w1 := util.BuildPod("ns1", "worker-1", "", apiv1.PodPending, api.BuildResourceList("3", "3k"), "pg1", map[string]string{"role": "worker"}, map[string]string{"selector": "worker"})
+	w2 := util.BuildPod("ns1", "worker-2", "", apiv1.PodPending, api.BuildResourceList("5", "5k"), "pg1", map[string]string{"role": "worker"}, map[string]string{})
+	w3 := util.BuildPod("ns1", "worker-3", "", apiv1.PodPending, api.BuildResourceList("4", "4k"), "pg2", map[string]string{"role": "worker"}, map[string]string{})
+	w1.Spec.Affinity = getWorkerAffinity()
+	w2.Spec.Affinity = getWorkerAffinity()
+	w3.Spec.Affinity = getWorkerAffinity()
+
+	// nodes
+	n1 := util.BuildNode("node1", api.BuildResourceList("14", "14k", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"selector": "worker"})
+	n2 := util.BuildNode("node2", api.BuildResourceList("3", "3k", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{})
+	n1.Labels["kubernetes.io/hostname"] = "node1"
+	n2.Labels["kubernetes.io/hostname"] = "node2"
+
+	// priority
+	p1 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p1"}, Value: 1}
+	p2 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 2}
+	// podgroup
+	pg1 := util.BuildPodGroupWithPrio("pg1", "ns1", "q1", 2, nil, schedulingv1beta1.PodGroupInqueue, p2.Name)
+	pg2 := util.BuildPodGroupWithPrio("pg2", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, p1.Name)
+
+	// queue
+	queue1 := util.BuildQueue("q1", 0, nil)
+
+	// tests
+	tests := []uthelper.TestCommonStruct{
+		{
+			Name:      "pod-deallocate",
+			Plugins:   plugins,
+			Pods:      []*apiv1.Pod{w1, w2, w3},
+			Nodes:     []*apiv1.Node{n1, n2},
+			PriClass:  []*schedulingv1.PriorityClass{p1, p2},
+			PodGroups: []*schedulingv1beta1.PodGroup{pg1, pg2},
+			Queues:    []*schedulingv1beta1.Queue{queue1},
+			ExpectBindMap: map[string]string{ // podKey -> node
+				"ns1/worker-3": "node1",
+			},
+			ExpectBindsNum: 1,
+		},
+	}
+
+	for i, test := range tests {
+		// allocate
+		actions := []framework.Action{allocate.New()}
+		trueValue := true
+		tiers := []conf.Tier{
+			{
+				Plugins: []conf.PluginOption{
+					{
+						Name:             PluginName,
+						EnabledPredicate: &trueValue,
+					},
+					{
+						Name:                gang.PluginName,
+						EnabledJobReady:     &trueValue,
+						EnabledJobPipelined: &trueValue,
+					},
+					{
+						Name:            priority.PluginName,
+						EnabledJobOrder: &trueValue,
+					},
+				},
+			},
+		}
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, nil)
+			defer test.Close()
+			test.Run(actions)
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestNodeNum(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		PluginName: New,
+	}
+
+	// pending pods
+	w1 := util.BuildPod("ns1", "worker-1", "", apiv1.PodPending, nil, "pg1", map[string]string{"role": "worker"}, map[string]string{"selector": "worker"})
+	w2 := util.BuildPod("ns1", "worker-2", "", apiv1.PodPending, nil, "pg1", map[string]string{"role": "worker"}, map[string]string{})
+	w3 := util.BuildPod("ns1", "worker-3", "", apiv1.PodPending, nil, "pg2", map[string]string{"role": "worker"}, map[string]string{})
+
+	// nodes
+	n1 := util.BuildNode("node1", api.BuildResourceList("4", "4k", []api.ScalarResource{{Name: "pods", Value: "2"}}...), map[string]string{"selector": "worker"})
+
+	// priority
+	p1 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p1"}, Value: 1}
+	p2 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 2}
+
+	// podgroup
+	pg1 := util.BuildPodGroupWithPrio("pg1", "ns1", "q1", 2, nil, schedulingv1beta1.PodGroupInqueue, p2.Name)
+	pg2 := util.BuildPodGroupWithPrio("pg2", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, p1.Name)
+
+	// queue
+	queue1 := util.BuildQueue("q1", 0, nil)
+
+	// tests
+	tests := []uthelper.TestCommonStruct{
+		{
+			Name:      "pod-predicate",
+			Plugins:   plugins,
+			Pods:      []*apiv1.Pod{w1, w2, w3},
+			Nodes:     []*apiv1.Node{n1},
+			PriClass:  []*schedulingv1.PriorityClass{p1, p2},
+			PodGroups: []*schedulingv1beta1.PodGroup{pg1, pg2},
+			Queues:    []*schedulingv1beta1.Queue{queue1},
+			ExpectBindMap: map[string]string{ // podKey -> node
+				"ns1/worker-1": "node1",
+				"ns1/worker-2": "node1",
+			},
+			ExpectBindsNum: 2,
+		},
+	}
+
+	for i, test := range tests {
+		// allocate
+		actions := []framework.Action{allocate.New(), backfill.New()}
+		trueValue := true
+		tiers := []conf.Tier{
+			{
+				Plugins: []conf.PluginOption{
+					{
+						Name:             PluginName,
+						EnabledPredicate: &trueValue,
+					},
+				},
+			},
+		}
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, nil)
+			defer test.Close()
+			test.Run(actions)
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPodAntiAffinity(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		PluginName:          New,
+		priority.PluginName: priority.New,
+	}
+	highPrio := util.BuildPriorityClass("high-priority", 100000)
+	lowPrio := util.BuildPriorityClass("low-priority", 10)
+
+	w1 := util.BuildPodWithPriority("ns1", "worker-1", "n1", apiv1.PodRunning, api.BuildResourceList("3", "3G"), "pg1", map[string]string{"role": "worker"}, map[string]string{}, &highPrio.Value)
+	w2 := util.BuildPodWithPriority("ns1", "worker-2", "n1", apiv1.PodRunning, api.BuildResourceList("3", "3G"), "pg1", map[string]string{}, map[string]string{}, &lowPrio.Value)
+	w3 := util.BuildPodWithPriority("ns1", "worker-3", "", apiv1.PodPending, api.BuildResourceList("3", "3G"), "pg2", map[string]string{"role": "worker"}, map[string]string{}, &highPrio.Value)
+	w1.Spec.Affinity = getWorkerAffinity()
+	w3.Spec.Affinity = getWorkerAffinity()
+
+	// nodes
+	n1 := util.BuildNode("n1", api.BuildResourceList("12", "12G", []api.ScalarResource{{Name: "pods", Value: "2"}}...), map[string]string{})
+	n1.Labels["kubernetes.io/hostname"] = "node1"
+
+	// podgroup
+	pg1 := util.BuildPodGroupWithPrio("pg1", "ns1", "q1", 0, nil, schedulingv1beta1.PodGroupRunning, lowPrio.Name)
+	pg2 := util.BuildPodGroupWithPrio("pg2", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, highPrio.Name)
+
+	// queue
+	queue1 := util.BuildQueue("q1", 0, api.BuildResourceList("9", "9G"))
+
+	// tests
+	tests := []uthelper.TestCommonStruct{
+		{
+			Name:            "pod-anti-affinity",
+			Plugins:         plugins,
+			Pods:            []*apiv1.Pod{w1, w2, w3},
+			Nodes:           []*apiv1.Node{n1},
+			PriClass:        []*schedulingv1.PriorityClass{lowPrio, highPrio},
+			PodGroups:       []*schedulingv1beta1.PodGroup{pg1, pg2},
+			Queues:          []*schedulingv1beta1.Queue{queue1},
+			ExpectPipeLined: map[string][]string{},
+			ExpectEvicted:   []string{},
+			ExpectEvictNum:  0,
+		},
+	}
+
+	for i, test := range tests {
+		// allocate
+		actions := []framework.Action{allocate.New(), preempt.New()}
+		trueValue := true
+		tiers := []conf.Tier{
+			{
+				Plugins: []conf.PluginOption{
+					{
+						Name:             PluginName,
+						EnabledPredicate: &trueValue,
+					},
+					{
+						Name:               priority.PluginName,
+						EnabledPreemptable: &trueValue,
+						EnabledJobStarving: &trueValue,
+					},
+				},
+			},
+		}
+		test.PriClass = []*schedulingv1.PriorityClass{highPrio, lowPrio}
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, []conf.Configuration{{Name: actions[1].Name(),
+				Arguments: map[string]interface{}{preempt.EnableTopologyAwarePreemptionKey: true}}})
+			defer test.Close()
+			test.Run(actions)
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSetUpDynamicResourcesArgs_Default(t *testing.T) {
+	dra := defaultDynamicResourcesArgs()
+	setUpDynamicResourcesArgs(dra, nil)
+
+	assert.Equal(t, &metav1.Duration{Duration: defaultDRAFilterTimeout}, dra.FilterTimeout)
+}
+
+func TestSetUpDynamicResourcesArgs_OverideSeconds(t *testing.T) {
+	tests := []struct {
+		name        string
+		rawArgs     framework.Arguments
+		expectedDur time.Duration
+	}{
+		{
+			name:        "override with seconds (int)",
+			rawArgs:     framework.Arguments{draFilterTimeoutSecondsKey: 3},
+			expectedDur: 3 * time.Second,
+		},
+		{
+			name:        "ignore negative seconds",
+			rawArgs:     framework.Arguments{draFilterTimeoutSecondsKey: -5},
+			expectedDur: defaultDRAFilterTimeout,
+		},
+		{
+			name:        "no key keeps default",
+			rawArgs:     framework.Arguments{},
+			expectedDur: defaultDRAFilterTimeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dra := defaultDynamicResourcesArgs()
+			setUpDynamicResourcesArgs(dra, tt.rawArgs)
+			assert.Equal(t, &metav1.Duration{Duration: tt.expectedDur}, dra.FilterTimeout)
+		})
+	}
+}
+
+func TestInitPlugin(t *testing.T) {
+	tests := []struct {
+		name                    string
+		enableNodeAffinity      bool
+		enableNodePorts         bool
+		enableTaintToleration   bool
+		enablePodAffinity       bool
+		enableNodeVolumeLimits  bool
+		enableVolumeZone        bool
+		enablePodTopologySpread bool
+		enableVolumeBinding     bool
+		enableDRA               bool
+		enableNodeDeclaredFeat  bool
+		expectInFilter          []string
+		expectInStableFilter    []string
+		expectInPrefilter       []string
+		expectInPreScore        []string
+		expectInReserve         []string
+		expectInPreBind         []string
+		expectInScore           []string
+		expectNotInFilter       []string
+		expectNotInStableFilter []string
+		expectNotInPrefilter    []string
+		expectNotInPreScore     []string
+		expectNotInReserve      []string
+		expectNotInPreBind      []string
+		expectNotInScore        []string
+	}{
+		{
+			name:                    "all default plugins enabled without volume binding and dra",
+			enableNodeAffinity:      true,
+			enableNodePorts:         true,
+			enableTaintToleration:   true,
+			enablePodAffinity:       true,
+			enableNodeVolumeLimits:  true,
+			enableVolumeZone:        true,
+			enablePodTopologySpread: true,
+			enableVolumeBinding:     false,
+			enableDRA:               false,
+			expectInFilter:          []string{nodeunschedulable.Name, nodeaffinity.Name, nodeports.Name, tainttoleration.Name, interpodaffinity.Name, nodevolumelimits.CSIName, volumezone.Name, podtopologyspread.Name},
+			expectInStableFilter:    []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name},
+			expectInPrefilter:       []string{nodeaffinity.Name, nodeports.Name, interpodaffinity.Name, nodevolumelimits.CSIName, volumezone.Name, podtopologyspread.Name},
+			expectNotInPreScore:     []string{volumebinding.Name, dynamicresources.Name},
+			expectInReserve:         []string{},
+			expectInPreBind:         []string{},
+			expectInScore:           []string{},
+			expectNotInFilter:       []string{volumebinding.Name, dynamicresources.Name, nodedeclaredfeatures.Name},
+			expectNotInStableFilter: []string{nodedeclaredfeatures.Name},
+			expectNotInPrefilter:    []string{nodedeclaredfeatures.Name},
+			expectNotInReserve:      []string{volumebinding.Name, dynamicresources.Name},
+			expectNotInPreBind:      []string{volumebinding.Name, dynamicresources.Name},
+			expectNotInScore:        []string{dynamicresources.Name, volumebinding.Name},
+		},
+		{
+			name:                    "volume binding enabled",
+			enableNodeAffinity:      true,
+			enableNodePorts:         false,
+			enableTaintToleration:   true,
+			enablePodAffinity:       false,
+			enableNodeVolumeLimits:  false,
+			enableVolumeZone:        false,
+			enablePodTopologySpread: false,
+			enableVolumeBinding:     true,
+			enableDRA:               false,
+			expectInFilter:          []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name, volumebinding.Name},
+			expectInStableFilter:    []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name},
+			expectInPrefilter:       []string{volumebinding.Name},
+			expectInPreScore:        []string{volumebinding.Name},
+			expectNotInPreScore:     []string{dynamicresources.Name},
+			expectInReserve:         []string{volumebinding.Name},
+			expectInPreBind:         []string{volumebinding.Name},
+			expectInScore:           []string{volumebinding.Name},
+			expectNotInFilter:       []string{nodeports.Name, interpodaffinity.Name, dynamicresources.Name},
+			expectNotInReserve:      []string{dynamicresources.Name},
+			expectNotInPreBind:      []string{dynamicresources.Name},
+		},
+		{
+			name:                    "dra enabled",
+			enableNodeAffinity:      true,
+			enableNodePorts:         false,
+			enableTaintToleration:   true,
+			enablePodAffinity:       false,
+			enableNodeVolumeLimits:  false,
+			enableVolumeZone:        false,
+			enablePodTopologySpread: false,
+			enableVolumeBinding:     false,
+			enableDRA:               true,
+			expectInFilter:          []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name, dynamicresources.Name},
+			expectInStableFilter:    []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name},
+			expectInPrefilter:       []string{nodeaffinity.Name, dynamicresources.Name},
+			expectNotInPreScore:     []string{volumebinding.Name, dynamicresources.Name},
+			expectInReserve:         []string{dynamicresources.Name},
+			expectInPreBind:         []string{dynamicresources.Name},
+			expectInScore:           []string{dynamicresources.Name},
+			expectNotInFilter:       []string{volumebinding.Name},
+			expectNotInReserve:      []string{volumebinding.Name},
+			expectNotInPreBind:      []string{volumebinding.Name},
+			expectNotInScore:        []string{volumebinding.Name},
+		},
+		{
+			name:                    "both volume binding and dra enabled",
+			enableNodeAffinity:      true,
+			enableNodePorts:         true,
+			enableTaintToleration:   true,
+			enablePodAffinity:       true,
+			enableNodeVolumeLimits:  true,
+			enableVolumeZone:        true,
+			enablePodTopologySpread: true,
+			enableVolumeBinding:     true,
+			enableDRA:               true,
+			expectInFilter:          []string{nodeunschedulable.Name, nodeaffinity.Name, nodeports.Name, tainttoleration.Name, interpodaffinity.Name, nodevolumelimits.CSIName, volumezone.Name, podtopologyspread.Name, volumebinding.Name, dynamicresources.Name},
+			expectInStableFilter:    []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name},
+			expectInPrefilter:       []string{nodeports.Name, interpodaffinity.Name, podtopologyspread.Name, volumebinding.Name, dynamicresources.Name},
+			expectInPreScore:        []string{volumebinding.Name},
+			expectNotInPreScore:     []string{dynamicresources.Name},
+			expectInReserve:         []string{volumebinding.Name, dynamicresources.Name},
+			expectInPreBind:         []string{volumebinding.Name, dynamicresources.Name},
+			expectInScore:           []string{volumebinding.Name, dynamicresources.Name},
+		},
+		{
+			name:                   "node declared features enabled",
+			enableNodeAffinity:     true,
+			enableTaintToleration:  true,
+			enableNodeDeclaredFeat: true,
+			expectInFilter:         []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name, nodedeclaredfeatures.Name},
+			expectInStableFilter:   []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name, nodedeclaredfeatures.Name},
+			expectInPrefilter:      []string{nodeaffinity.Name, nodedeclaredfeatures.Name},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset volume binding plugin for test isolation
+			ResetVolumeBindingPluginForTest()
+			featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.36"))
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDeclaredFeatures, tt.enableNodeDeclaredFeat)
+
+			pp := New(nil).(*PredicatesPlugin)
+			pp.enabledPredicates.nodeAffinityEnable = tt.enableNodeAffinity
+			pp.enabledPredicates.nodePortEnable = tt.enableNodePorts
+			pp.enabledPredicates.taintTolerationEnable = tt.enableTaintToleration
+			pp.enabledPredicates.podAffinityEnable = tt.enablePodAffinity
+			pp.enabledPredicates.nodeVolumeLimitsEnable = tt.enableNodeVolumeLimits
+			pp.enabledPredicates.volumeZoneEnable = tt.enableVolumeZone
+			pp.enabledPredicates.podTopologySpreadEnable = tt.enablePodTopologySpread
+			pp.enabledPredicates.volumeBindingEnable = tt.enableVolumeBinding
+			pp.enabledPredicates.dynamicResourceAllocationEnable = tt.enableDRA
+
+			nodeMap := map[string]k8sframework.NodeInfo{}
+			client := k8sfake.NewSimpleClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			pp.Handle = k8s.NewFramework(
+				nodeMap,
+				k8s.WithClientSet(client),
+				k8s.WithInformerFactory(informerFactory),
+			)
+
+			pp.InitPlugin()
+
+			// Verify FilterPlugins
+			for _, pluginName := range tt.expectInFilter {
+				if _, exists := pp.FilterPlugins[pluginName]; !exists {
+					t.Errorf("expected %s in FilterPlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInFilter {
+				if _, exists := pp.FilterPlugins[pluginName]; exists {
+					t.Errorf("expected %s not in FilterPlugins, but found", pluginName)
+				}
+			}
+
+			// Verify StableFilterPlugins
+			for _, pluginName := range tt.expectInStableFilter {
+				if _, exists := pp.StableFilterPlugins[pluginName]; !exists {
+					t.Errorf("expected %s in StableFilterPlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInStableFilter {
+				if _, exists := pp.StableFilterPlugins[pluginName]; exists {
+					t.Errorf("expected %s not in StableFilterPlugins, but found", pluginName)
+				}
+			}
+
+			// Verify PreFilterPlugins
+			for _, pluginName := range tt.expectInPrefilter {
+				if _, exists := pp.PreFilterPlugins[pluginName]; !exists {
+					t.Errorf("expected %s in PreFilterPlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInPrefilter {
+				if _, exists := pp.PreFilterPlugins[pluginName]; exists {
+					t.Errorf("expected %s not in PreFilterPlugins, but found", pluginName)
+				}
+			}
+
+			for _, pluginName := range tt.expectInPreScore {
+				if _, exists := pp.PreScorePlugins[pluginName]; !exists {
+					t.Errorf("expected %s in PreScorePlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInPreScore {
+				if _, exists := pp.PreScorePlugins[pluginName]; exists {
+					t.Errorf("expected %s not in PreScorePlugins, but found", pluginName)
+				}
+			}
+
+			// Verify ReservePlugins
+			for _, pluginName := range tt.expectInReserve {
+				if _, exists := pp.ReservePlugins[pluginName]; !exists {
+					t.Errorf("expected %s in ReservePlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInReserve {
+				if _, exists := pp.ReservePlugins[pluginName]; exists {
+					t.Errorf("expected %s not in ReservePlugins, but found", pluginName)
+				}
+			}
+
+			// Verify PreBindPlugins
+			for _, pluginName := range tt.expectInPreBind {
+				if _, exists := pp.PreBindPlugins[pluginName]; !exists {
+					t.Errorf("expected %s in PreBindPlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInPreBind {
+				if _, exists := pp.PreBindPlugins[pluginName]; exists {
+					t.Errorf("expected %s not in PreBindPlugins, but found", pluginName)
+				}
+			}
+
+			// Verify ScorePlugins
+			for _, pluginName := range tt.expectInScore {
+				if _, exists := pp.ScorePlugins[pluginName]; !exists {
+					t.Errorf("expected %s in ScorePlugins, but not found", pluginName)
+				}
+			}
+			for _, pluginName := range tt.expectNotInScore {
+				if _, exists := pp.ScorePlugins[pluginName]; exists {
+					t.Errorf("expected %s not in ScorePlugins, but found", pluginName)
+				}
+			}
+
+			// Verify VolumeBinding weight if enabled
+			if tt.enableVolumeBinding {
+				if weight, exists := pp.ScoreWeights[volumebinding.Name]; !exists || weight == 0 {
+					t.Errorf("expected VolumeBinding to have non-zero weight in ScoreWeights")
+				}
+			}
+			if tt.enableDRA {
+				if weight, exists := pp.ScoreWeights[dynamicresources.Name]; !exists || weight != 1 {
+					t.Errorf("expected DynamicResources to have weight 1 in ScoreWeights")
+				}
+			}
+		})
+	}
+}
+
+func TestBatchNodeOrderRunsPreScorePlugins(t *testing.T) {
+	tests := []struct {
+		name          string
+		preScoreState *k8sframework.Status
+		wantScore     bool
+		wantError     bool
+	}{
+		{
+			name:          "runs score after successful pre-score",
+			preScoreState: k8sframework.NewStatus(k8sframework.Success),
+			wantScore:     true,
+		},
+		{
+			name:          "skips matching score when pre-score skips",
+			preScoreState: k8sframework.NewStatus(k8sframework.Skip),
+		},
+		{
+			name:          "returns pre-score error",
+			preScoreState: k8sframework.NewStatus(k8sframework.Error, "pre-score failed"),
+			wantError:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := &fakePreScorePlugin{
+				name:           "test-pre-score-plugin",
+				preScoreStatus: tt.preScoreState,
+			}
+			pp := &PredicatesPlugin{
+				PreScorePlugins: map[string]k8sframework.PreScorePlugin{plugin.Name(): plugin},
+				PreScoreOrder:   []string{plugin.Name()},
+				ScorePlugins:    map[string]nodescore.BaseScorePlugin{plugin.Name(): plugin},
+				ScoreWeights:    map[string]int{plugin.Name(): 1},
+				ScoreOrder:      []string{plugin.Name()},
+			}
+			nodeInfo := schedframework.NewNodeInfo()
+			nodeInfo.SetNode(&apiv1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
+
+			scores, err := pp.BatchNodeOrder(
+				&api.TaskInfo{Pod: &apiv1.Pod{}},
+				[]k8sframework.NodeInfo{nodeInfo},
+				schedframework.NewCycleState(),
+			)
+			if tt.wantError {
+				if err == nil {
+					t.Fatal("expected pre-score error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("BatchNodeOrder returned an error: %v", err)
+			}
+			if plugin.preScoreCalls != 1 {
+				t.Errorf("expected PreScore to be called once, got %d", plugin.preScoreCalls)
+			}
+			_, scored := scores["node-a"]
+			if scored != tt.wantScore {
+				t.Errorf("expected node score presence to be %t, got %t", tt.wantScore, scored)
+			}
+		})
+	}
+}
+
+func TestBatchNodeOrderRunsScoreOnlyPlugins(t *testing.T) {
+	tests := []struct {
+		name         string
+		scoreWeights map[string]int
+		wantScore    float64
+	}{
+		{
+			name:         "uses configured weight",
+			scoreWeights: map[string]int{"score-only": 2},
+			wantScore:    50,
+		},
+		{
+			name:      "uses default weight",
+			wantScore: 25,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := &fakeScoreOnlyPlugin{name: "score-only", score: 25}
+			pp := &PredicatesPlugin{
+				ScorePlugins: map[string]nodescore.BaseScorePlugin{plugin.Name(): plugin},
+				ScoreWeights: tt.scoreWeights,
+				ScoreOrder:   []string{plugin.Name()},
+			}
+			nodeInfo := schedframework.NewNodeInfo()
+			nodeInfo.SetNode(&apiv1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
+
+			scores, err := pp.BatchNodeOrder(
+				&api.TaskInfo{Pod: &apiv1.Pod{}},
+				[]k8sframework.NodeInfo{nodeInfo},
+				schedframework.NewCycleState(),
+			)
+			if err != nil {
+				t.Fatalf("BatchNodeOrder returned an error: %v", err)
+			}
+			if scores["node-a"] != tt.wantScore {
+				t.Fatalf("expected node score %v, got %v", tt.wantScore, scores["node-a"])
+			}
+		})
+	}
+}
+
+func TestPredicateFailureReasonAggregationOrderStable(t *testing.T) {
+	pp := New(nil).(*PredicatesPlugin)
+	pp.enabledPredicates = predicateEnable{
+		nodeAffinityEnable:    true,
+		nodePortEnable:        true,
+		taintTolerationEnable: true,
+	}
+	pp.StableFilterPlugins = map[string]k8sframework.FilterPlugin{
+		nodeunschedulable.Name: &fakeFilterPlugin{name: nodeunschedulable.Name, message: "stable-nodeunschedulable"},
+		nodeaffinity.Name:      &fakeFilterPlugin{name: nodeaffinity.Name, message: "stable-nodeaffinity"},
+		tainttoleration.Name:   &fakeFilterPlugin{name: tainttoleration.Name, message: "stable-tainttoleration"},
+	}
+	pp.FilterPlugins = map[string]k8sframework.FilterPlugin{
+		nodeunschedulable.Name: &fakeFilterPlugin{name: nodeunschedulable.Name, message: "stable-nodeunschedulable"},
+		nodeaffinity.Name:      &fakeFilterPlugin{name: nodeaffinity.Name, message: "stable-nodeaffinity"},
+		nodeports.Name:         &fakeFilterPlugin{name: nodeports.Name, message: "normal-nodeports"},
+		tainttoleration.Name:   &fakeFilterPlugin{name: tainttoleration.Name, message: "stable-tainttoleration"},
+	}
+	// Predicate walks StableFilterOrder / FilterOrder (filled by InitPlugin in production). Mirror that order here.
+	pp.StableFilterOrder = []string{nodeunschedulable.Name, nodeaffinity.Name, tainttoleration.Name}
+	pp.FilterOrder = []string{nodeunschedulable.Name, nodeaffinity.Name, nodeports.Name, tainttoleration.Name}
+
+	node := &apiv1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Status: apiv1.NodeStatus{
+			Capacity: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("100"),
+			},
+			Allocatable: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("100"),
+			},
+		},
+	}
+	k8sNodeInfo := schedframework.NewNodeInfo()
+	k8sNodeInfo.SetNode(node)
+	pp.Handle = k8s.NewFramework(map[string]k8sframework.NodeInfo{"node-1": k8sNodeInfo})
+
+	task := api.NewTaskInfo(util.BuildPod("ns", "p1", "", apiv1.PodPending, nil, "pg", nil, nil))
+	volcanoNode := api.NewNodeInfo(node)
+
+	expected := []string{
+		"stable-nodeunschedulable",
+		"stable-nodeaffinity",
+		"stable-tainttoleration",
+		"normal-nodeports",
+	}
+	for i := 0; i < 20; i++ {
+		err := pp.Predicate(task, volcanoNode, schedframework.NewCycleState())
+		if err == nil {
+			t.Fatalf("expected predicate error, got nil")
+		}
+		fitErr, ok := err.(*api.FitError)
+		if !ok {
+			t.Fatalf("expected *api.FitError, got %T", err)
+		}
+		assert.Equal(t, expected, fitErr.Reasons())
+	}
+}
+
+func TestPredicateByStablefilterSkipsPluginInSkipSet(t *testing.T) {
+	pp := New(nil).(*PredicatesPlugin)
+	pp.enabledPredicates = predicateEnable{
+		nodeAffinityEnable: true,
+	}
+
+	skippedPlugin := &fakeTrackingFilterPlugin{name: nodeaffinity.Name}
+	normalPlugin := &fakeTrackingFilterPlugin{name: tainttoleration.Name}
+
+	pp.StableFilterPlugins = map[string]k8sframework.FilterPlugin{
+		nodeaffinity.Name:    skippedPlugin,
+		tainttoleration.Name: normalPlugin,
+	}
+	pp.StableFilterOrder = []string{nodeaffinity.Name, tainttoleration.Name}
+	pp.FilterPlugins = map[string]k8sframework.FilterPlugin{}
+	pp.FilterOrder = []string{}
+
+	node := &apiv1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Status: apiv1.NodeStatus{
+			Capacity: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("100"),
+			},
+			Allocatable: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("100"),
+			},
+		},
+	}
+	k8sNodeInfo := schedframework.NewNodeInfo()
+	k8sNodeInfo.SetNode(node)
+	pp.Handle = k8s.NewFramework(map[string]k8sframework.NodeInfo{"node-1": k8sNodeInfo})
+
+	task := api.NewTaskInfo(util.BuildPod("ns", "p1", "", apiv1.PodPending, nil, "pg", nil, nil))
+	volcanoNode := api.NewNodeInfo(node)
+
+	// Populate the skip set to simulate nodeaffinity.PreFilter returning Skip.
+	state := schedframework.NewCycleState()
+	state.SetSkipFilterPlugins(sets.New[string](nodeaffinity.Name))
+
+	err := pp.Predicate(task, volcanoNode, state)
+	if err != nil {
+		t.Fatalf("expected scheduling success, got: %v", err)
+	}
+	if skippedPlugin.callCount != 0 {
+		t.Fatalf("expected skipped plugin Filter() to not be called, got %d", skippedPlugin.callCount)
+	}
+	if normalPlugin.callCount != 1 {
+		t.Fatalf("expected non-skipped plugin Filter() to be called exactly once, got %d", normalPlugin.callCount)
+	}
+}
+
+func TestReserveRollbackOrderStable(t *testing.T) {
+	calls := make([]string, 0, 8)
+	pp := New(nil).(*PredicatesPlugin)
+	pp.enabledPredicates = predicateEnable{
+		volumeBindingEnable:             true,
+		dynamicResourceAllocationEnable: true,
+	}
+	pp.ReservePlugins = map[string]k8sframework.ReservePlugin{
+		volumebinding.Name:    &fakeReservePlugin{name: volumebinding.Name, calls: &calls},
+		dynamicresources.Name: &fakeReservePlugin{name: dynamicresources.Name, calls: &calls},
+	}
+	pp.ReserveOrder = []string{volumebinding.Name, dynamicresources.Name}
+
+	pod := util.BuildPod("ns", "p1", "", apiv1.PodPending, nil, "pg", nil, nil)
+	pod.Spec.NodeName = "node-1"
+	pod.Spec.Volumes = []apiv1.Volume{
+		{
+			Name: "pvc-vol",
+			VolumeSource: apiv1.VolumeSource{
+				PersistentVolumeClaim: &apiv1.PersistentVolumeClaimVolumeSource{ClaimName: "claim-1"},
+			},
+		},
+	}
+	task := api.NewTaskInfo(pod)
+
+	event := &framework.Event{Task: task}
+	pp.runReservePlugins(&framework.Session{}, event)
+	if event.Err != nil {
+		t.Fatalf("unexpected reserve error: %v", event.Err)
+	}
+
+	bindCtx := &cache.BindContext{
+		TaskInfo:   task,
+		Extensions: map[string]cache.BindContextExtension{pp.Name(): &BindContextExtension{State: schedframework.NewCycleState()}},
+	}
+	pp.PreBindRollBack(context.Background(), bindCtx)
+
+	assert.Equal(t, []string{
+		"reserve-VolumeBinding",
+		"reserve-DynamicResources",
+		"unreserve-DynamicResources",
+		"unreserve-VolumeBinding",
+	}, calls)
+}
+
+func TestNodeDeclaredFeatures(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDeclaredFeatures, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, volcanofeatures.UnschedulableJobCache, true)
+
+	plugins := map[string]framework.PluginBuilder{
+		PluginName: New,
+	}
+	trueValue := true
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:             PluginName,
+					EnabledPredicate: &trueValue,
+				},
+			},
+		},
+	}
+
+	// The pod requires RestartAllContainersOnContainerExits because of its RestartAllContainers rule.
+	pod := util.BuildPod("ns1", "p1", "", apiv1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, nil)
+	pod.Spec.Containers[0].RestartPolicyRules = []apiv1.ContainerRestartRule{{
+		Action: apiv1.ContainerRestartRuleActionRestartAllContainers,
+		ExitCodes: &apiv1.ContainerRestartRuleOnExitCodes{
+			Operator: apiv1.ContainerRestartRuleOnExitCodesOpIn,
+			Values:   []int32{42},
+		},
+	}}
+	buildNode := func(name string, declaredFeatures ...string) *apiv1.Node {
+		node := util.BuildNode(name, api.BuildResourceList("4", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil)
+		node.Status.DeclaredFeatures = declaredFeatures
+		return node
+	}
+	incompatibleNode := buildNode("node1")
+	compatibleNode := buildNode("node2", restartallcontainers.RestartAllContainersOnContainerExits)
+
+	tests := []struct {
+		name          string
+		nodes         []*apiv1.Node
+		expectBindMap map[string]string
+	}{
+		{
+			name:          "pod is bound to the node declaring the required feature",
+			nodes:         []*apiv1.Node{incompatibleNode, compatibleNode},
+			expectBindMap: map[string]string{"ns1/p1": "node2"},
+		},
+		{
+			name:          "pod waits when no node declares the required feature",
+			nodes:         []*apiv1.Node{incompatibleNode},
+			expectBindMap: map[string]string{},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobCache := unschedulable.NewJobCache(unschedulable.DefaultMaxSkipDuration)
+			runCycle := func(nodes []*apiv1.Node, expectBindMap map[string]string) *api.JobInfo {
+				test := uthelper.TestCommonStruct{
+					Name:           tt.name,
+					Plugins:        plugins,
+					Pods:           []*apiv1.Pod{pod.DeepCopy()},
+					Nodes:          nodes,
+					PodGroups:      []*schedulingv1beta1.PodGroup{util.BuildPodGroup("pg1", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue)},
+					Queues:         []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+					ExpectBindMap:  expectBindMap,
+					ExpectBindsNum: len(expectBindMap),
+				}
+				ssn := test.RegisterSession(tiers, nil, framework.WithUnschedulableJobCache(jobCache))
+				job := ssn.Jobs["ns1/pg1"]
+				test.Run([]framework.Action{allocate.New()})
+				checkErr := test.CheckAll(i)
+				test.Close()
+				if checkErr != nil {
+					t.Fatal(checkErr)
+				}
+				return job
+			}
+
+			job := runCycle(tt.nodes, tt.expectBindMap)
+			if len(tt.expectBindMap) > 0 {
+				return
+			}
+
+			// An empty bind map doesn't say why the pod stayed pending, so check the recorded rejection.
+			if rejections := jobCache.CachedRejections(job); assert.Len(t, rejections, 1) {
+				assert.Equal(t, nodedeclaredfeatures.Name, rejections[0].Plugin)
+			}
+
+			// Once the node declares the feature, the cached job is woken up and binds in the next cycle.
+			updatedNode := incompatibleNode.DeepCopy()
+			updatedNode.Status.DeclaredFeatures = []string{restartallcontainers.RestartAllContainersOnContainerExits}
+			jobCache.OnEvent(k8sframework.ClusterEvent{Resource: k8sframework.Node, ActionType: k8sframework.UpdateNodeDeclaredFeature}, incompatibleNode, updatedNode)
+			runCycle([]*apiv1.Node{updatedNode}, map[string]string{"ns1/p1": "node1"})
+		})
+	}
+}
+
+func TestOnAllocateRestoresEvictedTask(t *testing.T) {
+	node := &apiv1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Status: apiv1.NodeStatus{
+			Capacity: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("10"),
+			},
+			Allocatable: apiv1.ResourceList{
+				apiv1.ResourceCPU:    resource.MustParse("4"),
+				apiv1.ResourceMemory: resource.MustParse("8Gi"),
+				apiv1.ResourcePods:   resource.MustParse("10"),
+			},
+		},
+	}
+	// The volume binding reserve plugin reads prefilter state that only exists
+	// for tasks filtered in the current cycle, so a victim that is already
+	// bound fails to reserve with "not found".
+	reserveFailure := k8sframework.NewStatus(k8sframework.Error, "not found")
+
+	tests := []struct {
+		name         string
+		restore      bool
+		reserve      *k8sframework.Status
+		wantReserves int
+		wantErr      bool
+		wantPods     int
+	}{
+		{
+			name:         "a task allocated in this cycle reserves and joins the node info",
+			reserve:      k8sframework.NewStatus(k8sframework.Success),
+			wantReserves: 1,
+			wantPods:     1,
+		},
+		{
+			name:         "a failed reserve keeps the task out of the node info",
+			reserve:      reserveFailure,
+			wantReserves: 1,
+			wantErr:      true,
+			wantPods:     0,
+		},
+		{
+			name:     "a restored victim skips reserve and rejoins the node info",
+			restore:  true,
+			reserve:  reserveFailure,
+			wantPods: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := make([]string, 0, 1)
+			pp := New(nil).(*PredicatesPlugin)
+			pp.ReservePlugins = map[string]k8sframework.ReservePlugin{
+				volumebinding.Name: &fakeReservePlugin{name: volumebinding.Name, calls: &calls, status: tt.reserve},
+			}
+			pp.ReserveOrder = []string{volumebinding.Name}
+
+			nodeInfo := schedframework.NewNodeInfo()
+			nodeInfo.SetNode(node)
+			pp.Handle = k8s.NewFramework(map[string]k8sframework.NodeInfo{node.Name: nodeInfo})
+
+			ssn := &framework.Session{
+				Nodes: map[string]*api.NodeInfo{node.Name: api.NewNodeInfo(node)},
+			}
+			ssn.PodLister = framework.NewPodLister(ssn)
+
+			pod := util.BuildPod("ns", "victim", node.Name, apiv1.PodRunning, api.BuildResourceList("1", "1Gi"), "pg", nil, nil)
+			event := &framework.Event{Task: api.NewTaskInfo(pod), Restore: tt.restore}
+
+			pp.onAllocate(ssn, event)
+
+			if tt.wantErr {
+				assert.Error(t, event.Err)
+			} else {
+				assert.NoError(t, event.Err)
+			}
+			assert.Len(t, calls, tt.wantReserves)
+			info, err := pp.Handle.SnapshotSharedLister().NodeInfos().Get(node.Name)
+			assert.NoError(t, err)
+			assert.Len(t, info.GetPods(), tt.wantPods)
+		})
+	}
+}
+
+// TestDiscardRestoresEvictedTaskDeviceState drives eviction and rollback through a
+// scheduler session, so the predicates handler runs in the order the scheduler uses.
+// Statement.Evict removes the victim from the predicates node info, and Discard
+// unevicts it, which updates the task on the node and then fires the allocate
+// handler with Restore set. The victim must come back exactly once, with its
+// resource accounting restored and still on the GPU its annotation names.
+func TestDiscardRestoresEvictedTaskDeviceState(t *testing.T) {
+	gpushare.GpuSharingEnable = true
+	t.Cleanup(func() { gpushare.GpuSharingEnable = false })
+	api.RegisterDevice(gpushare.DeviceName)
+
+	gpuResource := apiv1.ResourceName(gpushare.VolcanoGPUResource)
+	node := util.BuildNode("node1", api.BuildResourceList("8", "8Gi", []api.ScalarResource{
+		{Name: "pods", Value: "10"},
+		{Name: gpushare.VolcanoGPUResource, Value: "16000"},
+		{Name: gpushare.VolcanoGPUNumber, Value: "2"},
+	}...), map[string]string{})
+	victim := util.BuildPod("ns1", "victim", "node1", apiv1.PodRunning, api.BuildResourceList("1", "1Gi"), "pg1", nil, nil)
+	victim.Spec.Containers[0].Resources.Limits = apiv1.ResourceList{gpuResource: resource.MustParse("4000")}
+	victim.Annotations[gpushare.GPUIndex] = "1"
+
+	var pp *PredicatesPlugin
+	test := uthelper.TestCommonStruct{
+		Name: "discard-restores-victim",
+		Plugins: map[string]framework.PluginBuilder{
+			PluginName: func(arguments framework.Arguments) framework.Plugin {
+				pp = New(arguments).(*PredicatesPlugin)
+				return pp
+			},
+		},
+		Pods:  []*apiv1.Pod{victim},
+		Nodes: []*apiv1.Node{node},
+		PodGroups: []*schedulingv1beta1.PodGroup{
+			util.BuildPodGroup("pg1", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning),
+		},
+		Queues: []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+	}
+	enabled := true
+	ssn := test.RegisterSession([]conf.Tier{{Plugins: []conf.PluginOption{{Name: PluginName, EnabledPredicate: &enabled}}}}, nil)
+	defer test.Close()
+
+	var task *api.TaskInfo
+	for _, job := range ssn.Jobs {
+		for _, running := range job.TaskStatusIndex[api.Running] {
+			if running.Name == "victim" {
+				task = running
+			}
+		}
+	}
+	if !assert.NotNil(t, task, "the running victim should be in the session") {
+		return
+	}
+
+	predicatesPodCount := func() int {
+		info, err := pp.Handle.SnapshotSharedLister().NodeInfos().Get(node.Name)
+		assert.NoError(t, err)
+		return len(info.GetPods())
+	}
+	assert.Equal(t, 1, predicatesPodCount(), "the session starts with the victim in the predicates node info")
+
+	stmt := ssn.Statement()
+	stmt.Evict(task, "test-reclaim")
+	assert.Zero(t, predicatesPodCount(), "eviction removes the victim from the predicates node info")
+
+	stmt.Discard()
+	assert.Equal(t, 1, predicatesPodCount(), "discard restores exactly one entry for the victim")
+
+	nodeInfo := ssn.Nodes[node.Name]
+	assert.True(t, nodeInfo.Used.Equal(task.Resreq, api.Zero), "used = %s, want %s", nodeInfo.Used, task.Resreq)
+	assert.True(t, nodeInfo.Releasing.IsEmpty(), "releasing = %s, want empty", nodeInfo.Releasing)
+
+	devices, ok := nodeInfo.Others[gpushare.DeviceName].(*gpushare.GPUDevices)
+	if !assert.True(t, ok, "expected gpushare devices on the node info, got %T", nodeInfo.Others[gpushare.DeviceName]) {
+		return
+	}
+	holders := make([]int, 0, len(devices.Device))
+	for id, device := range devices.Device {
+		if _, found := device.PodMap[string(victim.UID)]; found {
+			holders = append(holders, id)
+		}
+	}
+	assert.Equal(t, []int{1}, holders, "a restored victim keeps the device its annotation names")
+	assert.Equal(t, "1", task.Pod.Annotations[gpushare.GPUIndex], "a restored victim is not reassigned to another device")
+}

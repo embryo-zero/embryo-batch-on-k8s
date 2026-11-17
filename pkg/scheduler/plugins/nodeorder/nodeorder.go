@@ -1,0 +1,455 @@
+/*
+Copyright 2019 The Kubernetes Authors.
+Copyright 2019-2025 The Volcano Authors.
+
+Modifications made by Volcano authors:
+- Refactored to use Kubernetes native scheduling plugins for improved compatibility
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package nodeorder
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"unicode"
+
+	v1 "k8s.io/api/core/v1"
+	utilFeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/podtopologyspread"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util/k8s"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util/nodescore"
+)
+
+const (
+	// PluginName indicates name of volcano scheduler plugin.
+	PluginName = "nodeorder"
+
+	// NodeAffinityWeight is the key for providing Node Affinity Priority Weight in YAML
+	NodeAffinityWeight = "nodeaffinity.weight"
+	// PodAffinityWeight is the key for providing Pod Affinity Priority Weight in YAML
+	PodAffinityWeight = "podaffinity.weight"
+	// LeastRequestedWeight is the key for providing Least Requested Priority Weight in YAML
+	LeastRequestedWeight = "leastrequested.weight"
+	// BalancedResourceWeight is the key for providing Balanced Resource Priority Weight in YAML
+	BalancedResourceWeight = "balancedresource.weight"
+	// BalancedResourceResources is the key for resources considered by Balanced Resource Allocation in YAML
+	BalancedResourceResources = "balancedresource.resources"
+	// MostRequestedWeight is the key for providing Most Requested Priority Weight in YAML
+	MostRequestedWeight = "mostrequested.weight"
+	// TaintTolerationWeight is the key for providing Taint Toleration Priority Weight in YAML
+	TaintTolerationWeight = "tainttoleration.weight"
+	// ImageLocalityWeight is the key for providing Image Locality Priority Weight in YAML
+	ImageLocalityWeight = "imagelocality.weight"
+	// PodTopologySpreadWeight is the key for providing Pod Topology Spread Priority Weight in YAML
+	PodTopologySpreadWeight = "podtopologyspread.weight"
+)
+
+type NodeOrderPlugin struct {
+	// Arguments given for the plugin
+	pluginArguments       framework.Arguments
+	weight                priorityWeight
+	Handle                fwk.Handle
+	ScorePlugins          map[string]scorePluginEntry
+	NodeOrderScorePlugins map[string]ScorePluginWithWeight
+}
+
+// scorePluginEntry contains a score plugin used by BatchNodeOrderFn.
+// If all score plugins support PreScore in the future, ScorePluginWithWeight can be replaced by scorePluginEntry
+type scorePluginEntry struct {
+	plugin nodescore.BaseScorePlugin
+	weight int
+}
+
+type ScorePluginWithWeight struct {
+	plugin fwk.ScorePlugin
+	weight int
+}
+
+// New function returns nodeorder plugin object.
+func New(arguments framework.Arguments) framework.Plugin {
+	weight := calculateWeight(arguments)
+	return &NodeOrderPlugin{pluginArguments: arguments, weight: weight}
+}
+
+func (pp *NodeOrderPlugin) Name() string {
+	return PluginName
+}
+
+type priorityWeight struct {
+	leastReqWeight              int
+	mostReqWeight               int
+	nodeAffinityWeight          int
+	podAffinityWeight           int
+	balancedResourceWeight      int
+	balancedAllocationResources map[v1.ResourceName]int32
+	taintTolerationWeight       int
+	imageLocalityWeight         int
+	podTopologySpreadWeight     int
+}
+
+// calculateWeight from the provided arguments.
+//
+// Currently only supported priorities are nodeaffinity, podaffinity, leastrequested,
+// mostrequested, balancedresouce, imagelocality, tainttoleration.
+//
+// User should specify priority weights in the config in this format:
+//
+//	actions: "reclaim, allocate, backfill, preempt"
+//	tiers:
+//	- plugins:
+//	  - name: priority
+//	  - name: gang
+//	  - name: conformance
+//	- plugins:
+//	  - name: drf
+//	  - name: predicates
+//	  - name: proportion
+//	  - name: nodeorder
+//	    arguments:
+//	      leastrequested.weight: 1
+//	      mostrequested.weight: 0
+//	      nodeaffinity.weight: 2
+//	      podaffinity.weight: 2
+//	      balancedresource.weight: 1
+//	      balancedresource.resources: nvidia.com/gpu, example.com/foo
+//	      tainttoleration.weight: 3
+//	      imagelocality.weight: 1
+//	      podtopologyspread.weight: 2
+func calculateWeight(args framework.Arguments) priorityWeight {
+	// Initial values for weights.
+	// By default, for backward compatibility and for reasonable scores,
+	// least requested priority is enabled and most requested priority is disabled.
+	weight := priorityWeight{
+		leastReqWeight:              1,
+		mostReqWeight:               0,
+		nodeAffinityWeight:          2,
+		podAffinityWeight:           2,
+		balancedResourceWeight:      1,
+		balancedAllocationResources: make(map[v1.ResourceName]int32),
+		taintTolerationWeight:       3,
+		imageLocalityWeight:         1,
+		podTopologySpreadWeight:     2, // be consistent with kubernetes default setting.
+	}
+
+	// Checks whether nodeaffinity.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.nodeAffinityWeight, NodeAffinityWeight)
+
+	// Checks whether podaffinity.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.podAffinityWeight, PodAffinityWeight)
+
+	// Checks whether leastrequested.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.leastReqWeight, LeastRequestedWeight)
+
+	// Checks whether mostrequested.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.mostReqWeight, MostRequestedWeight)
+
+	// Checks whether balancedresource.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.balancedResourceWeight, BalancedResourceWeight)
+
+	// Checks whether tainttoleration.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.taintTolerationWeight, TaintTolerationWeight)
+
+	// Checks whether imagelocality.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.imageLocalityWeight, ImageLocalityWeight)
+
+	// Checks whether podtopologyspread.weight is provided or not, if given, modifies the value in weight struct.
+	args.GetInt(&weight.podTopologySpreadWeight, PodTopologySpreadWeight)
+
+	// Checks whether balancedresource.resources is provided or not. If provided, it
+	// defines the resources considered by Balanced Resource Allocation.
+	resourcesStr, ok := args[BalancedResourceResources].(string)
+	if !ok {
+		resourcesStr = ""
+	}
+
+	resources := strings.FieldsFunc(resourcesStr, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+	for _, resource := range resources {
+		weight.balancedAllocationResources[v1.ResourceName(resource)] = 1
+	}
+
+	// Fall back to the historical default resources to stay backward compatible
+	// when balancedresource.resources is not configured.
+	if len(weight.balancedAllocationResources) == 0 {
+		weight.balancedAllocationResources = defaultBalancedAllocationResources()
+	}
+
+	return weight
+}
+
+func defaultBalancedAllocationResources() map[v1.ResourceName]int32 {
+	return map[v1.ResourceName]int32{
+		v1.ResourceCPU:                    1,
+		v1.ResourceMemory:                 1,
+		v1.ResourceName("nvidia.com/gpu"): 1,
+	}
+}
+
+// buildBalancedAllocationResourceSpecs converts the configured resources into the
+// ResourceSpec list expected by NodeResourcesBalancedAllocationArgs. Resources are
+// sorted by name so the generated configuration is deterministic.
+func buildBalancedAllocationResourceSpecs(resources map[v1.ResourceName]int32) []config.ResourceSpec {
+	names := make([]string, 0, len(resources))
+	for name := range resources {
+		names = append(names, string(name))
+	}
+	sort.Strings(names)
+
+	specs := make([]config.ResourceSpec, 0, len(names))
+	for _, name := range names {
+		specs = append(specs, config.ResourceSpec{
+			Name:   name,
+			Weight: int64(resources[v1.ResourceName(name)]),
+		})
+	}
+	return specs
+}
+
+func (pp *NodeOrderPlugin) OnSessionOpen(ssn *framework.Session) {
+	nodeMap := ssn.NodeMap
+	// Initialize k8s scheduling plugins
+	handle := k8s.NewFramework(nodeMap,
+		k8s.WithClientSet(ssn.KubeClient()),
+		k8s.WithInformerFactory(ssn.InformerFactory()),
+	)
+	pp.Handle = handle
+	pp.InitPlugin()
+
+	ssn.AddNodeOrderFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) (float64, error) {
+		nodeInfo := nodeMap[node.Name]
+		state := k8sframework.NewCycleState()
+		return pp.NodeOrderFn(task, node, nodeInfo, state)
+	})
+
+	ssn.AddBatchNodeOrderFn(pp.Name(), func(task *api.TaskInfo, nodes []*api.NodeInfo) (map[string]float64, error) {
+		state := k8sframework.NewCycleState()
+		return pp.BatchNodeOrderFn(task, nodes, nodeMap, state)
+	})
+}
+
+func (pp *NodeOrderPlugin) InitPlugin() {
+	scorePlugins := map[string]scorePluginEntry{}
+	nodeOrderScorePlugins := map[string]ScorePluginWithWeight{}
+
+	fts := feature.Features{
+		EnableNodeInclusionPolicyInPodTopologySpread:  utilFeature.DefaultFeatureGate.Enabled(features.NodeInclusionPolicyInPodTopologySpread),
+		EnableMatchLabelKeysInPodTopologySpread:       utilFeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpread),
+		EnablePodLevelResources:                       utilFeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+		EnableInPlacePodLevelResourcesVerticalScaling: utilFeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
+	}
+
+	if pp.weight.leastReqWeight != 0 {
+		// 1. NodeResourcesLeastAllocated
+		leastAllocatedArgs := &config.NodeResourcesFitArgs{
+			ScoringStrategy: &config.ScoringStrategy{
+				Type:      config.LeastAllocated,
+				Resources: []config.ResourceSpec{{Name: "cpu", Weight: 50}, {Name: "memory", Weight: 50}},
+			},
+		}
+		if p, err := noderesources.NewFit(context.TODO(), leastAllocatedArgs, pp.Handle, fts); err == nil {
+			leastAllocated := p.(*noderesources.Fit)
+			scorePlugins[leastAllocated.Name()+"_LeastAllocated"] = scorePluginEntry{
+				plugin: leastAllocated,
+				weight: pp.weight.leastReqWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init Least Allocated plugin %v", err)
+		}
+	}
+
+	if pp.weight.mostReqWeight != 0 {
+		// 2. NodeResourcesMostAllocated
+		mostAllocatedArgs := &config.NodeResourcesFitArgs{
+			ScoringStrategy: &config.ScoringStrategy{
+				Type:      config.MostAllocated,
+				Resources: []config.ResourceSpec{{Name: "cpu", Weight: 1}, {Name: "memory", Weight: 1}},
+			},
+		}
+		if p, err := noderesources.NewFit(context.TODO(), mostAllocatedArgs, pp.Handle, fts); err == nil {
+			mostAllocation := p.(*noderesources.Fit)
+			scorePlugins[mostAllocation.Name()+"_MostAllocated"] = scorePluginEntry{
+				plugin: mostAllocation,
+				weight: pp.weight.mostReqWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init Most Allocated plugin %v", err)
+		}
+	}
+
+	if pp.weight.balancedResourceWeight != 0 {
+		// 3. NodeResourcesBalancedAllocation
+		balancedResources := pp.weight.balancedAllocationResources
+		if len(balancedResources) == 0 {
+			balancedResources = defaultBalancedAllocationResources()
+		}
+		blArgs := &config.NodeResourcesBalancedAllocationArgs{
+			Resources: buildBalancedAllocationResourceSpecs(balancedResources),
+		}
+		if p, err := noderesources.NewBalancedAllocation(context.TODO(), blArgs, pp.Handle, fts); err == nil {
+			balancedAllocation := p.(*noderesources.BalancedAllocation)
+			scorePlugins[balancedAllocation.Name()] = scorePluginEntry{
+				plugin: balancedAllocation,
+				weight: pp.weight.balancedResourceWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init Balanced Resource Allocation plugin %v", err)
+		}
+	}
+
+	if pp.weight.nodeAffinityWeight != 0 {
+		// 4. NodeAffinity
+		naArgs := &config.NodeAffinityArgs{
+			AddedAffinity: &v1.NodeAffinity{},
+		}
+		if p, err := nodeaffinity.New(context.TODO(), naArgs, pp.Handle, fts); err == nil {
+			nodeAffinity := p.(*nodeaffinity.NodeAffinity)
+			scorePlugins[nodeAffinity.Name()] = scorePluginEntry{
+				plugin: nodeAffinity,
+				weight: pp.weight.nodeAffinityWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init Node Affinity plugin %v", err)
+		}
+	}
+
+	// 5. ImageLocality
+	if pp.weight.imageLocalityWeight != 0 {
+		if p, err := imagelocality.New(context.TODO(), nil, pp.Handle); err == nil {
+			imageLocality := p.(*imagelocality.ImageLocality)
+			nodeOrderScorePlugins[imageLocality.Name()] = ScorePluginWithWeight{imageLocality, pp.weight.imageLocalityWeight}
+		} else {
+			klog.Errorf("Failed to init Image Locality plugin %v", err)
+		}
+	}
+
+	// 6. InterPodAffinity
+	if pp.weight.podAffinityWeight != 0 {
+		plArgs := &config.InterPodAffinityArgs{}
+		if p, err := interpodaffinity.New(context.TODO(), plArgs, pp.Handle, fts); err == nil {
+			interPodAffinity := p.(*interpodaffinity.InterPodAffinity)
+			scorePlugins[interpodaffinity.Name] = scorePluginEntry{
+				plugin: interPodAffinity,
+				weight: pp.weight.podAffinityWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init InterPodAffinity plugin %v", err)
+		}
+	}
+
+	// 7. TaintToleration
+	if pp.weight.taintTolerationWeight != 0 {
+		if p, err := tainttoleration.New(context.TODO(), nil, pp.Handle, fts); err == nil {
+			taintToleration := p.(*tainttoleration.TaintToleration)
+			scorePlugins[tainttoleration.Name] = scorePluginEntry{
+				plugin: taintToleration,
+				weight: pp.weight.taintTolerationWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init TaintToleration plugin %v", err)
+		}
+	}
+
+	// 8. PodTopologySpread
+	if pp.weight.podTopologySpreadWeight != 0 {
+		ptsArgs := &config.PodTopologySpreadArgs{
+			DefaultingType: config.SystemDefaulting,
+		}
+		if p, err := podtopologyspread.New(context.TODO(), ptsArgs, pp.Handle, fts); err == nil {
+			podTopologySpread := p.(*podtopologyspread.PodTopologySpread)
+			scorePlugins[podtopologyspread.Name] = scorePluginEntry{
+				plugin: podTopologySpread,
+				weight: pp.weight.podTopologySpreadWeight,
+			}
+		} else {
+			klog.Errorf("Failed to init PodTopologySpread plugin %v", err)
+		}
+	}
+
+	pp.NodeOrderScorePlugins = nodeOrderScorePlugins
+	pp.ScorePlugins = scorePlugins
+}
+
+func (pp *NodeOrderPlugin) NodeOrderFn(task *api.TaskInfo, node *api.NodeInfo, k8sNodeInfo fwk.NodeInfo, state *k8sframework.CycleState) (float64, error) {
+	var nodeScore = 0.0
+	for name, p := range pp.NodeOrderScorePlugins {
+		if klog.V(5).Enabled() {
+			klog.V(5).Infof("Score node through %s plugin", name)
+		}
+		score, status := p.plugin.Score(context.TODO(), state, task.Pod, k8sNodeInfo)
+		if !status.IsSuccess() {
+			klog.Warningf("Node: %s, <%s> Priority Failed because of Error: %v", node.Name, name, status.AsError())
+			return 0, status.AsError()
+		}
+
+		// Score from each plugin is multiplied by its configured weight before being added to the total.
+		weightedScore := float64(score) * float64(p.weight)
+		nodeScore += weightedScore
+		if klog.V(5).Enabled() {
+			klog.V(5).Infof("Node: %s, task<%s/%s> plugin %s weight %d, raw score: %d, weighted score: %f", node.Name, task.Namespace, task.Name, name, p.weight, score, weightedScore)
+		}
+	}
+	if klog.V(4).Enabled() {
+		klog.V(4).Infof("Nodeorder Total Score for task<%s/%s> on node %s is: %f", task.Namespace, task.Name, node.Name, nodeScore)
+	}
+	return nodeScore, nil
+}
+
+// BatchNodeOrderFn scores all candidate nodes for the given task in one call.
+func (pp *NodeOrderPlugin) BatchNodeOrderFn(task *api.TaskInfo, nodes []*api.NodeInfo, nodeMap map[string]fwk.NodeInfo, state *k8sframework.CycleState) (map[string]float64, error) {
+	nodeInfos := nodescore.NodeInfosForCandidateNodes(nodes, nodeMap)
+	// Adapt nodeorder's plugin registry to the common input used by RunScorePlugins.
+	preScorePluginEntries := make([]nodescore.PreScorePluginEntry, 0, len(pp.ScorePlugins))
+	scorePluginEntries := make([]nodescore.ScorePluginEntry, 0, len(pp.ScorePlugins))
+	for name, entry := range pp.ScorePlugins {
+		scorePluginEntries = append(scorePluginEntries, nodescore.ScorePluginEntry{
+			Name:   name,
+			Plugin: entry.plugin,
+			Weight: entry.weight,
+		})
+		if preScorePlugin, ok := entry.plugin.(fwk.PreScorePlugin); ok {
+			preScorePluginEntries = append(preScorePluginEntries, nodescore.PreScorePluginEntry{
+				Name:   name,
+				Plugin: preScorePlugin,
+			})
+		}
+	}
+
+	nodeScores, err := nodescore.RunScorePlugins(preScorePluginEntries, scorePluginEntries, state, task.Pod, nodeInfos)
+	if err != nil {
+		return nil, err
+	}
+
+	klog.V(4).Infof("Batch Total Score for task %s/%s is: %v", task.Namespace, task.Name, nodeScores)
+	return nodeScores, nil
+}
+
+func (pp *NodeOrderPlugin) OnSessionClose(ssn *framework.Session) {
+}

@@ -1,0 +1,1148 @@
+/*
+Copyright 2017 The Kubernetes Authors.
+Copyright 2018-2025 The Volcano Authors.
+
+Modifications made by Volcano authors:
+- Enhanced test coverage for cache functionality
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cache
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
+	kcache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	vcv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	vcclient "volcano.sh/apis/pkg/client/clientset/versioned"
+	vcclientfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	"volcano.sh/volcano/pkg/features"
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/util"
+	schedulercache "volcano.sh/volcano/pkg/schedulercommon/cache"
+)
+
+// addDRAResource returns at once even at the maximum count and scales the capacity
+// exactly, without relying on the caller to bound count.
+func TestAddDRAResource_constantTimeForHugeCount(t *testing.T) {
+	const dc = "gpu.example.com"
+	m := make(map[string]*api.DRAResource)
+	capacity := map[string]resource.Quantity{"memory": resource.MustParse("2Gi")}
+
+	done := make(chan struct{})
+	go func() {
+		addDRAResource(m, dc, math.MaxInt64, capacity)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("addDRAResource did not return within 5s for count=MaxInt64")
+	}
+
+	// 2Gi * MaxInt64 = 19807040628566084396238503936, the exact scaled total.
+	got := m[dc].Capacity["memory"]
+	if want := resource.MustParse("19807040628566084396238503936"); got.Cmp(want) != 0 {
+		t.Fatalf("capacity = %s for count=MaxInt64; want exact %s", got.AsDec().String(), want.AsDec().String())
+	}
+}
+
+func buildNode(name string, alloc v1.ResourceList) *v1.Node {
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:  types.UID(name),
+			Name: name,
+		},
+		Status: v1.NodeStatus{
+			Capacity:    alloc,
+			Allocatable: alloc,
+		},
+	}
+}
+
+func buildPod(ns, n, nn string,
+	p v1.PodPhase, req v1.ResourceList,
+	owner []metav1.OwnerReference, labels map[string]string) *v1.Pod {
+
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:             types.UID(fmt.Sprintf("%v-%v", ns, n)),
+			Name:            n,
+			Namespace:       ns,
+			OwnerReferences: owner,
+			Labels:          labels,
+		},
+		Status: v1.PodStatus{
+			Phase: p,
+		},
+		Spec: v1.PodSpec{
+			NodeName: nn,
+			Containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: req,
+					},
+				},
+			},
+		},
+	}
+}
+
+func buildOwnerReference(owner string) metav1.OwnerReference {
+	controller := true
+	return metav1.OwnerReference{
+		Controller: &controller,
+		UID:        types.UID(owner),
+	}
+}
+
+func TestGetOrCreateJob(t *testing.T) {
+	owner1 := buildOwnerReference("j1")
+	owner2 := buildOwnerReference("j2")
+
+	pod1 := buildPod("c1", "p1", "n1", v1.PodRunning, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner1}, make(map[string]string))
+	pi1 := api.NewTaskInfo(pod1)
+	pi1.Job = "j1" // The job name is set by cache.
+
+	pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner2}, make(map[string]string))
+	pod2.Spec.SchedulerName = "volcano"
+	pi2 := api.NewTaskInfo(pod2)
+
+	pod3 := buildPod("c3", "p3", "n1", v1.PodRunning, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner2}, make(map[string]string))
+	pi3 := api.NewTaskInfo(pod3)
+
+	cache := &SchedulerCache{
+		Nodes:          make(map[string]*api.NodeInfo),
+		Jobs:           make(map[api.JobID]*api.JobInfo),
+		schedulerNames: []string{"volcano"},
+	}
+
+	tests := []struct {
+		task   *api.TaskInfo
+		gotJob bool // whether getOrCreateJob will return job for corresponding task
+	}{
+		{
+			task:   pi1,
+			gotJob: true,
+		},
+		{
+			task:   pi2,
+			gotJob: false,
+		},
+		{
+			task:   pi3,
+			gotJob: false,
+		},
+	}
+	for i, test := range tests {
+		result := cache.getOrCreateJob(test.task) != nil
+		if result != test.gotJob {
+			t.Errorf("case %d: \n expected %t, \n got %t \n",
+				i, test.gotJob, result)
+		}
+	}
+}
+
+func TestSchedulerCache_Bind_NodeWithSufficientResources(t *testing.T) {
+	owner := buildOwnerReference("j1")
+
+	cache := &SchedulerCache{
+		Jobs:            make(map[api.JobID]*api.JobInfo),
+		Nodes:           make(map[string]*api.NodeInfo),
+		Binder:          util.NewFakeBinder(0),
+		BindFlowChannel: make(chan *BindContext, 5000),
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	cache.AddPod(pod)
+
+	node := buildNode("n1", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	cache.AddOrUpdateNode(node)
+
+	task := api.NewTaskInfo(pod)
+	task.Job = "j1"
+	if err := cache.addTask(task); err != nil {
+		t.Errorf("failed to add task %v", err)
+	}
+	task.NodeName = "n1"
+	bindContext := &BindContext{TaskInfo: task}
+	err := cache.AddBindTask(bindContext)
+	if err != nil {
+		t.Errorf("failed to bind pod to node: %v", err)
+	}
+}
+
+func TestDefaultBinderBindUsesTaskPodAnnotations(t *testing.T) {
+	pod := buildPod("default", "worker-0", "", v1.PodPending, nil, nil, nil)
+	pod.Annotations = map[string]string{"keep": "pod"}
+	task := api.NewTaskInfo(pod)
+	task.NodeName = "node-a"
+	task.MergePodAnnotations(map[string]string{
+		"keep":                  "task",
+		"volcano.sh/vgpu-node":  "node-a",
+		"volcano.sh/vgpu-ids":   "GPU-aaaa",
+		"volcano.sh/bind-phase": "allocating",
+	})
+
+	kubeClient := kubefake.NewSimpleClientset(pod)
+	binder := NewDefaultBinder(kubeClient, record.NewFakeRecorder(10))
+
+	errMsg := binder.Bind(kubeClient, []*api.TaskInfo{task})
+	if len(errMsg) > 0 {
+		t.Fatalf("Bind returned errors: %v", errMsg)
+	}
+
+	var binding *v1.Binding
+	for _, action := range kubeClient.Actions() {
+		if action.GetVerb() != "create" || action.GetSubresource() != "binding" {
+			continue
+		}
+		createAction, ok := action.(kubetesting.CreateAction)
+		if !ok {
+			t.Fatalf("expected create binding action, got %T", action)
+		}
+		var okBinding bool
+		binding, okBinding = createAction.GetObject().(*v1.Binding)
+		if !okBinding {
+			t.Fatalf("expected Binding object, got %T", createAction.GetObject())
+		}
+		break
+	}
+	if binding == nil {
+		t.Fatalf("expected binder to create a Pod binding")
+	}
+	if binding.Target.Name != "node-a" {
+		t.Fatalf("expected binding target node-a, got %q", binding.Target.Name)
+	}
+	if binding.Annotations["keep"] != "task" {
+		t.Fatalf("expected binding annotations to overwrite existing annotations, got %q", binding.Annotations["keep"])
+	}
+	if binding.Annotations["volcano.sh/vgpu-node"] != "node-a" {
+		t.Fatalf("expected vgpu annotation on binding, got %q", binding.Annotations["volcano.sh/vgpu-node"])
+	}
+	if binding.Annotations["volcano.sh/bind-phase"] != "allocating" {
+		t.Fatalf("expected bind phase annotation on binding, got %q", binding.Annotations["volcano.sh/bind-phase"])
+	}
+}
+
+func TestSchedulerCache_Bind_NodeWithInsufficientResources(t *testing.T) {
+	owner := buildOwnerReference("j1")
+
+	cache := &SchedulerCache{
+		Jobs:            make(map[api.JobID]*api.JobInfo),
+		Nodes:           make(map[string]*api.NodeInfo),
+		Binder:          util.NewFakeBinder(0),
+		BindFlowChannel: make(chan *BindContext, 5000),
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("5000m", "50G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	cache.AddPod(pod)
+
+	node := buildNode("n1", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	cache.AddOrUpdateNode(node)
+
+	task := api.NewTaskInfo(pod)
+	task.Job = "j1"
+
+	if err := cache.addTask(task); err != nil {
+		t.Errorf("failed to add task %v", err)
+	}
+
+	task.NodeName = "n1"
+	taskBeforeBind := task.Clone()
+	nodeBeforeBind := cache.Nodes["n1"].Clone()
+
+	bindContext := &BindContext{TaskInfo: task}
+	err := cache.AddBindTask(bindContext)
+	if err == nil {
+		t.Errorf("expected bind to fail for node with insufficient resources")
+	}
+
+	_, taskAfterBind, err := cache.findJobAndTask(task)
+	if err != nil {
+		t.Errorf("expected to find task after failed bind")
+	}
+	if !equality.Semantic.DeepEqual(taskBeforeBind, taskAfterBind) {
+		t.Errorf("expected task to remain the same after failed bind: \n %#v\n %#v", taskBeforeBind, taskAfterBind)
+	}
+
+	nodeAfterBind := cache.Nodes["n1"].Clone()
+	if !reflect.DeepEqual(nodeBeforeBind, nodeAfterBind) {
+		t.Errorf("expected node to remain the same after failed bind")
+	}
+}
+
+func TestNodeOperation(t *testing.T) {
+	// case 1
+	node1 := buildNode("n1", api.BuildResourceList("2000m", "10G"))
+	node2 := buildNode("n2", api.BuildResourceList("4000m", "16G"))
+	node3 := buildNode("n3", api.BuildResourceList("3000m", "12G"))
+	nodeInfo1 := api.NewNodeInfo(node1)
+	nodeInfo2 := api.NewNodeInfo(node2)
+	nodeInfo3 := api.NewNodeInfo(node3)
+	tests := []struct {
+		deletedNode *v1.Node
+		nodes       []*v1.Node
+		expected    *SchedulerCache
+		delExpect   *SchedulerCache
+	}{
+		{
+			deletedNode: node2,
+			nodes:       []*v1.Node{node1, node2, node3},
+			expected: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n1": nodeInfo1,
+					"n2": nodeInfo2,
+					"n3": nodeInfo3,
+				},
+				NodeList: []string{"n1", "n2", "n3"},
+			},
+			delExpect: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n1": nodeInfo1,
+					"n3": nodeInfo3,
+				},
+				NodeList: []string{"n1", "n3"},
+			},
+		},
+		{
+			deletedNode: node1,
+			nodes:       []*v1.Node{node1, node2, node3},
+			expected: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n1": nodeInfo1,
+					"n2": nodeInfo2,
+					"n3": nodeInfo3,
+				},
+				NodeList: []string{"n1", "n2", "n3"},
+			},
+			delExpect: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n2": nodeInfo2,
+					"n3": nodeInfo3,
+				},
+				NodeList: []string{"n2", "n3"},
+			},
+		},
+		{
+			deletedNode: node3,
+			nodes:       []*v1.Node{node1, node2, node3},
+			expected: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n1": nodeInfo1,
+					"n2": nodeInfo2,
+					"n3": nodeInfo3,
+				},
+				NodeList: []string{"n1", "n2", "n3"},
+			},
+			delExpect: &SchedulerCache{
+				Nodes: map[string]*api.NodeInfo{
+					"n1": nodeInfo1,
+					"n2": nodeInfo2,
+				},
+				NodeList: []string{"n1", "n2"},
+			},
+		},
+	}
+
+	for i, test := range tests {
+		cache := &SchedulerCache{
+			Nodes:    make(map[string]*api.NodeInfo),
+			NodeList: []string{},
+		}
+
+		for _, n := range test.nodes {
+			cache.AddOrUpdateNode(n)
+		}
+
+		if !reflect.DeepEqual(cache, test.expected) {
+			t.Errorf("case %d: \n expected %v, \n got %v \n",
+				i, test.expected, cache)
+		}
+
+		// delete node
+		cache.RemoveNode(test.deletedNode.Name)
+		if !reflect.DeepEqual(cache, test.delExpect) {
+			t.Errorf("case %d: \n expected %v, \n got %v \n",
+				i, test.delExpect, cache)
+		}
+	}
+}
+
+func TestBindTasks(t *testing.T) {
+	owner := buildOwnerReference("j1")
+	scheduler := "fake-scheduler"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sc := NewDefaultMockSchedulerCache(scheduler)
+	sc.Run(ctx.Done())
+	kubeCli := sc.kubeClient
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"), []metav1.OwnerReference{owner}, make(map[string]string))
+	node := buildNode("n1", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	pod.Annotations = map[string]string{"scheduling.k8s.io/group-name": "j1"}
+	pod.Spec.SchedulerName = scheduler
+
+	// make sure pod exist when calling fake client binding
+	kubeCli.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	// set node in cache directly
+	kubeCli.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+
+	// wait for pod synced
+	time.Sleep(100 * time.Millisecond)
+	task := api.NewTaskInfo(pod)
+	task.NodeName = "n1"
+	bindContext := &BindContext{TaskInfo: task}
+	err := sc.AddBindTask(bindContext)
+	if err != nil {
+		t.Errorf("failed to bind pod to node: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	r := sc.Recorder.(*record.FakeRecorder)
+	if len(r.Events) != 1 {
+		t.Fatalf("successfully binding task should have 1 event")
+	}
+}
+
+func TestExecutePreBinds(t *testing.T) {
+	pod := buildPod("test-ns", "test-pod", "expect-node", v1.PodPending, nil, nil, nil)
+	task := api.NewTaskInfo(pod)
+	bindContext := &BindContext{
+		TaskInfo: task,
+	}
+	successfulPreBinder := &mockPreBinder{
+		preBindFn: func(ctx context.Context, bc *BindContext) error {
+			return nil
+		},
+	}
+	failedPreBinder := &mockPreBinder{
+		preBindFn: func(ctx context.Context, bc *BindContext) error {
+			return fmt.Errorf("prebind failed")
+		},
+	}
+
+	tests := []struct {
+		name               string
+		preBinders         []PreBinder
+		bindContexts       []*BindContext
+		expectBindContexts []*BindContext
+	}{
+		{
+			name:               "no pre-binders",
+			preBinders:         []PreBinder{},
+			bindContexts:       []*BindContext{bindContext},
+			expectBindContexts: []*BindContext{bindContext},
+		},
+		{
+			name:               "single successful pre-binder",
+			preBinders:         []PreBinder{successfulPreBinder},
+			bindContexts:       []*BindContext{bindContext},
+			expectBindContexts: []*BindContext{bindContext},
+		},
+		{
+			name:               "multiple pre-binders with one failure",
+			preBinders:         []PreBinder{successfulPreBinder, failedPreBinder},
+			bindContexts:       []*BindContext{bindContext},
+			expectBindContexts: []*BindContext{},
+		},
+		{
+			name:               "multiple successful pre-binders",
+			preBinders:         []PreBinder{successfulPreBinder, successfulPreBinder},
+			bindContexts:       []*BindContext{bindContext},
+			expectBindContexts: []*BindContext{bindContext},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := NewCustomMockSchedulerCache("mock-scheduler", nil, nil, nil, nil, nil)
+
+			for index, pb := range tt.preBinders {
+				sc.RegisterBinder(fmt.Sprintf("prebinder-%d", index), pb)
+			}
+
+			preBinders := sc.binderRegistry.getRegisteredPreBinders()
+			result := sc.executePreBinds(context.Background(), tt.bindContexts, preBinders)
+
+			if !reflect.DeepEqual(result, tt.expectBindContexts) {
+				t.Errorf("case %s: expected bind contexts %v, but got %v",
+					tt.name, tt.expectBindContexts, result)
+			}
+		})
+	}
+}
+
+type mockPreBinder struct {
+	preBindFn func(context.Context, *BindContext) error
+}
+
+func (m *mockPreBinder) PreBind(ctx context.Context, bindCtx *BindContext) error {
+	return m.preBindFn(ctx, bindCtx)
+}
+
+func (m *mockPreBinder) PreBindRollBack(ctx context.Context, bindCtx *BindContext) {
+	// do nothing
+}
+
+func TestNewDefaultAndRootQueue(t *testing.T) {
+	rootQueue := "root"
+	defaultQueue := "default"
+
+	tests := []struct {
+		name             string
+		vcClient         vcclient.Interface
+		concurrentNumber int
+	}{
+		{
+			name:             "successfully create the both queues",
+			vcClient:         vcclientfake.NewSimpleClientset(),
+			concurrentNumber: 2,
+		}, {
+			name:             "successfully create the default queue, skip the root queue",
+			vcClient:         vcclientfake.NewSimpleClientset(&vcv1beta1.Queue{ObjectMeta: metav1.ObjectMeta{Name: rootQueue}}),
+			concurrentNumber: 2,
+		}, {
+			name:             "successfully create the root queue, skip the default queue",
+			vcClient:         vcclientfake.NewSimpleClientset(&vcv1beta1.Queue{ObjectMeta: metav1.ObjectMeta{Name: defaultQueue}}),
+			concurrentNumber: 2,
+		}, {
+			name: "skip the both queues",
+			vcClient: vcclientfake.NewSimpleClientset(&vcv1beta1.Queue{ObjectMeta: metav1.ObjectMeta{Name: rootQueue}},
+				&vcv1beta1.Queue{ObjectMeta: metav1.ObjectMeta{Name: defaultQueue}}),
+			concurrentNumber: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var wg sync.WaitGroup
+			wg.Add(tt.concurrentNumber)
+			for i := 0; i < tt.concurrentNumber; i++ {
+				go func() {
+					defer wg.Done()
+					newDefaultAndRootQueue(tt.vcClient, defaultQueue)
+				}()
+			}
+			wg.Wait()
+			_, rootErr := tt.vcClient.SchedulingV1beta1().Queues().Get(context.TODO(), rootQueue, metav1.GetOptions{})
+			assert.NoError(t, rootErr)
+			_, defaultErr := tt.vcClient.SchedulingV1beta1().Queues().Get(context.TODO(), defaultQueue, metav1.GetOptions{})
+			assert.NoError(t, defaultErr)
+		})
+	}
+}
+
+func TestNewDefaultAndRootQueueInitializesNamespaceQueueAuthorization(t *testing.T) {
+	tests := []struct {
+		name             string
+		namespaceQueue   bool
+		initialQueueSpec *vcv1beta1.QueueSpec
+		wantAllowed      []string
+	}{
+		{
+			name:           "new default queue with NamespaceQueue enabled",
+			namespaceQueue: true,
+			wantAllowed:    []string{"*"},
+		},
+		{
+			name:           "new default queue with NamespaceQueue disabled",
+			namespaceQueue: false,
+		},
+		{
+			name:           "existing default queue with explicit allowedNamespaces is preserved",
+			namespaceQueue: true,
+			initialQueueSpec: &vcv1beta1.QueueSpec{
+				AllowedNamespaces: []string{"team-a"},
+			},
+			wantAllowed: []string{"team-a"},
+		},
+		{
+			name:           "existing default queue with explicit empty allowedNamespaces is preserved",
+			namespaceQueue: true,
+			initialQueueSpec: &vcv1beta1.QueueSpec{
+				AllowedNamespaces: []string{},
+			},
+			wantAllowed: []string{},
+		},
+		{
+			name:             "existing default queue without allowedNamespaces is upgraded",
+			namespaceQueue:   true,
+			initialQueueSpec: &vcv1beta1.QueueSpec{},
+			wantAllowed:      []string{"*"},
+		},
+		{
+			name:             "existing default queue is untouched with NamespaceQueue disabled",
+			namespaceQueue:   false,
+			initialQueueSpec: &vcv1beta1.QueueSpec{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NamespaceQueue, tt.namespaceQueue)
+
+			var objects []runtime.Object
+			if tt.initialQueueSpec != nil {
+				objects = append(objects, &vcv1beta1.Queue{
+					ObjectMeta: metav1.ObjectMeta{Name: "default"},
+					Spec:       *tt.initialQueueSpec,
+				})
+			}
+			client := vcclientfake.NewSimpleClientset(objects...)
+			newDefaultAndRootQueue(client, "default")
+
+			queue, err := client.SchedulingV1beta1().Queues().Get(context.TODO(), "default", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("failed to get default queue: %v", err)
+			}
+			assert.Equal(t, tt.wantAllowed, queue.Spec.AllowedNamespaces)
+		})
+	}
+}
+
+// mockHandlerRegistration is a mock implementation of cache.ResourceEventHandlerRegistration
+type mockHandlerRegistration struct {
+	synced bool
+}
+
+func (m *mockHandlerRegistration) HasSynced() bool {
+	return m.synced
+}
+
+func (m *mockHandlerRegistration) HasSyncedChecker() kcache.DoneChecker {
+	ch := make(chan struct{})
+	if m.synced {
+		close(ch)
+	}
+	return &mockHandlerDoneChecker{name: "mockHandlerRegistration", ch: ch}
+}
+
+type mockHandlerDoneChecker struct {
+	name string
+	ch   chan struct{}
+}
+
+func (m *mockHandlerDoneChecker) Name() string {
+	return m.name
+}
+
+func (m *mockHandlerDoneChecker) Done() <-chan struct{} {
+	return m.ch
+}
+
+// TestWaitForHandlerSync_AllHandlersSynced verifies that WaitForHandlerSync returns quickly
+// when all registered handlers have already synced.
+func TestWaitForHandlerSync_AllHandlersSynced(t *testing.T) {
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"handler1": &mockHandlerRegistration{synced: true},
+			"handler2": &mockHandlerRegistration{synced: true},
+		},
+		resourceSyncTimeout: 5 * time.Second,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, time.Second, "WaitForHandlerSync should return quickly when all handlers are synced")
+}
+
+// TestWaitForHandlerSync_SomeHandlersNotSyncedTimeout verifies that WaitForHandlerSync returns
+// after the resourceSyncTimeout expires when some handlers have not synced.
+func TestWaitForHandlerSync_SomeHandlersNotSyncedTimeout(t *testing.T) {
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"handler1": &mockHandlerRegistration{synced: true},
+			"handler2": &mockHandlerRegistration{synced: false},
+		},
+		resourceSyncTimeout: 300 * time.Millisecond,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.GreaterOrEqual(t, elapsed, 200*time.Millisecond, "WaitForHandlerSync should wait until timeout when some handlers are not synced")
+	assert.Less(t, elapsed, 2*time.Second, "WaitForHandlerSync should not exceed much more than the resourceSyncTimeout")
+}
+
+// TestWaitForHandlerSync_StopChanClosedBeforeSync verifies that WaitForHandlerSync returns early
+// when stopChan is closed before any handler has synced.
+func TestWaitForHandlerSync_StopChanClosedBeforeSync(t *testing.T) {
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"handler1": &mockHandlerRegistration{synced: false},
+		},
+		resourceSyncTimeout: 10 * time.Second,
+	}
+
+	stopCh := make(chan struct{})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(stopCh)
+	}()
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 2*time.Second, "WaitForHandlerSync should return early when stopChan is closed")
+}
+
+// TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_Synced verifies that WaitForHandlerSync
+// returns quickly when an InitialEventAsyncHandlerTracker has both upstream synced and no pending objects.
+func TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_Synced(t *testing.T) {
+	mockReg := &mockHandlerRegistration{synced: true}
+	tracker := schedulercache.NewQueueHandlerTracker(mockReg)
+
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"node": schedulercache.NewInitialEventHandlerRegistration(mockReg, tracker),
+		},
+		resourceSyncTimeout: 5 * time.Second,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.True(t, tracker.HasSynced(), "InitialEventAsyncHandlerTracker should report HasSynced=true")
+	assert.Less(t, elapsed, time.Second, "WaitForHandlerSync should return quickly when InitialEventAsyncHandlerTracker is synced")
+}
+
+// TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_UpstreamNotSynced verifies that
+// WaitForHandlerSync times out when an InitialEventAsyncHandlerTracker's upstream has not synced.
+func TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_UpstreamNotSynced(t *testing.T) {
+	mockReg := &mockHandlerRegistration{synced: false}
+	tracker := schedulercache.NewQueueHandlerTracker(mockReg)
+
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"node": schedulercache.NewInitialEventHandlerRegistration(mockReg, tracker),
+		},
+		resourceSyncTimeout: 300 * time.Millisecond,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.False(t, tracker.HasSynced(), "InitialEventAsyncHandlerTracker should report HasSynced=false when upstream not synced")
+	assert.GreaterOrEqual(t, elapsed, 200*time.Millisecond, "WaitForHandlerSync should timeout when tracker upstream is not synced")
+}
+
+// TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_PendingObjects verifies that
+// WaitForHandlerSync times out when an InitialEventAsyncHandlerTracker still has pending objects
+// in its queue even though the upstream informer has synced.
+func TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_PendingObjects(t *testing.T) {
+	mockReg := &mockHandlerRegistration{synced: true}
+	tracker := schedulercache.NewQueueHandlerTracker(mockReg)
+	tracker.Add("node1")
+	tracker.Add("node2")
+
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"node": schedulercache.NewInitialEventHandlerRegistration(mockReg, tracker),
+		},
+		resourceSyncTimeout: 300 * time.Millisecond,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.False(t, tracker.HasSynced(), "InitialEventAsyncHandlerTracker should report HasSynced=false when there are pending objects")
+	assert.GreaterOrEqual(t, elapsed, 200*time.Millisecond, "WaitForHandlerSync should timeout when tracker has pending objects")
+}
+
+// TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_CompletesAfterDone verifies that
+// WaitForHandlerSync returns successfully once all pending objects in an
+// InitialEventAsyncHandlerTracker are marked Done.
+func TestWaitForHandlerSync_InitialEventAsyncHandlerTracker_CompletesAfterDone(t *testing.T) {
+	mockReg := &mockHandlerRegistration{synced: true}
+	tracker := schedulercache.NewQueueHandlerTracker(mockReg)
+	tracker.Add("node1")
+
+	sc := &SchedulerCache{
+		registeredHandlers: map[string]kcache.ResourceEventHandlerRegistration{
+			"node": schedulercache.NewInitialEventHandlerRegistration(mockReg, tracker),
+		},
+		resourceSyncTimeout: 5 * time.Second,
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// Simulate async handler completing processing of node1
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		tracker.Done("node1")
+	}()
+
+	start := time.Now()
+	sc.WaitForHandlerSync(stopCh)
+	elapsed := time.Since(start)
+
+	assert.True(t, tracker.HasSynced(), "InitialEventAsyncHandlerTracker should report HasSynced=true after all objects are Done")
+	assert.Less(t, elapsed, 2*time.Second, "WaitForHandlerSync should return after all pending objects are processed")
+	assert.GreaterOrEqual(t, elapsed, 100*time.Millisecond, "WaitForHandlerSync should wait until Done is called")
+}
+
+func TestAddUnassignedNumaPods_NodeMissingSkipsWithoutCrash(t *testing.T) {
+	sc := newCacheWithNodes("n1")
+
+	allocated := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {
+			"ghost-node": resSets("0-1"),
+			"n1":         resSets("0-1"),
+		},
+	}
+
+	if err := sc.AddUnassignedNumaPods(allocated); err != nil {
+		t.Fatalf("AddUnassignedNumaPods returned error: %v", err)
+	}
+
+	n1 := sc.Nodes["n1"]
+	if len(n1.UnassignedNumaPods) != 1 {
+		t.Fatalf("expected exactly one entry on n1, got %v", n1.UnassignedNumaPods)
+	}
+	got, ok := n1.UnassignedNumaPods[api.PodMeta{UID: "uid-1", Name: "p1", Namespace: "ns1"}]
+	if !ok {
+		t.Fatalf("expected entry for p1 on n1")
+	}
+	if !got["cpu"].Equals(mustParseCPUSet("0-1")) {
+		t.Errorf("CPUSet on n1 mismatch: got %v", got["cpu"])
+	}
+}
+
+func TestAddUnassignedNumaPods_LazilyInitializesMap(t *testing.T) {
+	sc := newCacheWithNodes("n1")
+	if sc.Nodes["n1"].UnassignedNumaPods != nil {
+		t.Fatalf("precondition: UnassignedNumaPods should start nil")
+	}
+
+	allocated := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {"n1": resSets("0-1")},
+	}
+
+	if err := sc.AddUnassignedNumaPods(allocated); err != nil {
+		t.Fatalf("AddUnassignedNumaPods returned error: %v", err)
+	}
+
+	if sc.Nodes["n1"].UnassignedNumaPods == nil {
+		t.Fatalf("expected UnassignedNumaPods to be initialized")
+	}
+}
+
+func TestAddUnassignedNumaPods_MultiplePodsAccumulateOnSameNode(t *testing.T) {
+	sc := newCacheWithNodes("n1")
+
+	allocated := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {"n1": resSets("0-1")},
+		{UID: "uid-2", Name: "p2", Namespace: "ns1"}: {"n1": resSets("2-3")},
+	}
+
+	if err := sc.AddUnassignedNumaPods(allocated); err != nil {
+		t.Fatalf("AddUnassignedNumaPods returned error: %v", err)
+	}
+
+	unassigned := sc.Nodes["n1"].UnassignedNumaPods
+	if len(unassigned) != 2 {
+		t.Fatalf("expected 2 unassigned pods on n1, got %d", len(unassigned))
+	}
+	for _, pm := range []api.PodMeta{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"},
+		{UID: "uid-2", Name: "p2", Namespace: "ns1"},
+	} {
+		if _, ok := unassigned[pm]; !ok {
+			t.Errorf("missing entry for %v on n1", pm)
+		}
+	}
+}
+
+func TestAddUnassignedNumaPods_RewritesExistingEntryOnResend(t *testing.T) {
+	sc := newCacheWithNodes("n1")
+
+	first := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {"n1": resSets("0-1")},
+	}
+	if err := sc.AddUnassignedNumaPods(first); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Same pod resubmitted with a different decision — must overwrite, not merge.
+	second := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {"n1": resSets("4-5")},
+	}
+	if err := sc.AddUnassignedNumaPods(second); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if len(sc.Nodes["n1"].UnassignedNumaPods) != 1 {
+		t.Fatalf("expected 1 entry after resend, got %v", sc.Nodes["n1"].UnassignedNumaPods)
+	}
+	got := sc.Nodes["n1"].UnassignedNumaPods[api.PodMeta{UID: "uid-1", Name: "p1", Namespace: "ns1"}]["cpu"]
+	if !got.Equals(mustParseCPUSet("4-5")) {
+		t.Errorf("expected overwrite to 4-5, got %v", got)
+	}
+}
+
+func TestAddUnassignedNumaPods_NilNodeValueSkips(t *testing.T) {
+	// Edge case: explicitly stored nil node should be skipped, mirroring the guard.
+	sc := newCacheWithNodes()
+	sc.Nodes["nil-node"] = nil
+
+	allocated := map[api.PodMeta]map[string]api.ResNumaSets{
+		{UID: "uid-1", Name: "p1", Namespace: "ns1"}: {"nil-node": resSets("0-1")},
+	}
+
+	if err := sc.AddUnassignedNumaPods(allocated); err != nil {
+		t.Fatalf("AddUnassignedNumaPods returned error: %v", err)
+	}
+	// No panic is the success condition.
+}
+
+// TestUpdateJobInfo_PropagatesNominatedHyperNode locks in the cache writeback
+// for gangpreempt/gangreclaim's NominatedHyperNode pin. Without this
+// propagation the pin is wiped by the next Snapshot+CloneStatusFrom, defeating
+// the per-subJob fast path in allocate.
+func TestUpdateJobInfo_PropagatesNominatedHyperNode(t *testing.T) {
+	jobID := api.JobID("ns/job")
+	subID := api.SubJobID("sub-1")
+
+	cached := &api.JobInfo{
+		UID: jobID,
+		SubJobs: map[api.SubJobID]*api.SubJobInfo{
+			subID: {UID: subID, Job: jobID},
+		},
+	}
+	sc := &SchedulerCache{
+		Jobs: map[api.JobID]*api.JobInfo{jobID: cached},
+	}
+
+	// Session-side copy carries the gangpreempt/gangreclaim decision.
+	sessionView := &api.JobInfo{
+		UID:                          jobID,
+		AllocatedHyperNode:           "hn-allocated",
+		AllocatedHyperNodeGeneration: 7,
+		SubJobs: map[api.SubJobID]*api.SubJobInfo{
+			subID: {
+				UID:                subID,
+				Job:                jobID,
+				AllocatedHyperNode: "hn-allocated",
+				NominatedHyperNode: "hn-nominated",
+			},
+		},
+	}
+
+	sc.updateJobInfo(sessionView)
+
+	assert.Equal(t, "hn-allocated", cached.AllocatedHyperNode)
+	assert.Equal(t, uint64(7), cached.AllocatedHyperNodeGeneration)
+	assert.Equal(t, "hn-allocated", cached.SubJobs[subID].AllocatedHyperNode)
+	assert.Equal(t, "hn-nominated", cached.SubJobs[subID].NominatedHyperNode,
+		"cache must persist NominatedHyperNode so the next cycle honors the gang-eviction pin")
+}
+
+// TestUpdateJobInfo_PropagatesNominationClear ensures that when allocate
+// clears NominatedHyperNode after consuming the pin, the empty value also
+// makes it back into the cache so the next session does not retry the stale
+// pin via the fast path.
+func TestUpdateJobInfo_PropagatesNominationClear(t *testing.T) {
+	jobID := api.JobID("ns/job")
+	subID := api.SubJobID("sub-1")
+
+	cached := &api.JobInfo{
+		UID: jobID,
+		SubJobs: map[api.SubJobID]*api.SubJobInfo{
+			subID: {UID: subID, Job: jobID, NominatedHyperNode: "hn-nominated"},
+		},
+	}
+	sc := &SchedulerCache{
+		Jobs: map[api.JobID]*api.JobInfo{jobID: cached},
+	}
+
+	sessionView := &api.JobInfo{
+		UID: jobID,
+		SubJobs: map[api.SubJobID]*api.SubJobInfo{
+			subID: {UID: subID, Job: jobID, NominatedHyperNode: ""},
+		},
+	}
+
+	sc.updateJobInfo(sessionView)
+
+	assert.Equal(t, "", cached.SubJobs[subID].NominatedHyperNode,
+		"cache must mirror allocate's clear-on-commit so the next cycle does not retry the consumed nomination")
+}
+
+// TestTaskUnschedulable_SyncsNominatedNodeNameToCache locks in that a
+// successful UpdatePodStatus with a non-empty nominatedNodeName is reflected
+// on the cache task's Pod pointer synchronously, without waiting on the pod
+// informer round-trip. This pairs with updateJobInfo's synchronous writeback
+// of NominatedHyperNode so the next session Snapshot sees a consistent
+// (NominatedHyperNode, NominatedNodeName) pair and validateNomination does
+// not spuriously invalidate the gangpreempt/gangreclaim pin.
+func TestTaskUnschedulable_SyncsNominatedNodeNameToCache(t *testing.T) {
+	owner := buildOwnerReference("j1")
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	task := api.NewTaskInfo(pod)
+
+	job := api.NewJobInfo(task.Job, task)
+	sc := &SchedulerCache{
+		Jobs:          map[api.JobID]*api.JobInfo{task.Job: job},
+		StatusUpdater: &util.FakeStatusUpdater{},
+		Recorder:      record.NewFakeRecorder(32),
+	}
+
+	err := sc.taskUnschedulable(task, api.PodReasonUnschedulable, "pending", "n-nominated")
+	assert.NoError(t, err)
+
+	cachedTask, ok := sc.Jobs[task.Job].Tasks[task.UID]
+	assert.True(t, ok, "cache must still track the task after taskUnschedulable")
+	assert.Equal(t, "n-nominated", cachedTask.Pod.Status.NominatedNodeName,
+		"cache task's NominatedNodeName must reflect the API-server write synchronously, without waiting on the pod informer")
+	assert.Equal(t, "", pod.Status.NominatedNodeName,
+		"the caller's original Pod pointer must be untouched (taskUnschedulable deep-copies before mutating)")
+}
+
+// TestTaskUnschedulable_DoesNotSyncWhenNominatedNodeNameEmpty guards that
+// the cache sync only runs when we actually wrote a nominatedNodeName. The
+// empty-nominated case is used for regular unschedulable reasons that must
+// not clobber a previously written NominatedNodeName (per the existing
+// updateNomiNode guard).
+func TestTaskUnschedulable_DoesNotSyncWhenNominatedNodeNameEmpty(t *testing.T) {
+	owner := buildOwnerReference("j1")
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	pod.Status.NominatedNodeName = "n-previous"
+	task := api.NewTaskInfo(pod)
+
+	job := api.NewJobInfo(task.Job, task)
+	sc := &SchedulerCache{
+		Jobs:          map[api.JobID]*api.JobInfo{task.Job: job},
+		StatusUpdater: &util.FakeStatusUpdater{},
+		Recorder:      record.NewFakeRecorder(32),
+	}
+
+	// Call taskUnschedulable with an empty nominatedNodeName - the sync
+	// must NOT touch the cached pod pointer for this case.
+	originalPod := sc.Jobs[task.Job].Tasks[task.UID].Pod
+	err := sc.taskUnschedulable(task, api.PodReasonUnschedulable, "still pending", "")
+	assert.NoError(t, err)
+	assert.Same(t, originalPod, sc.Jobs[task.Job].Tasks[task.UID].Pod,
+		"cache pod pointer must not be swapped when nominatedNodeName is empty")
+	assert.Equal(t, "n-previous", sc.Jobs[task.Job].Tasks[task.UID].Pod.Status.NominatedNodeName,
+		"previously written NominatedNodeName must remain intact")
+}
+
+// addDRAResource accumulates a user-controlled device count. A pod with two
+// same-deviceClass requests each near math.MaxInt64 (both individually valid:
+// the apiserver only rejects count <= 0) must not wrap the aggregate Count to a
+// negative value, which would later bypass the queue's DRA quota check.
+func TestAddDRAResource_saturates(t *testing.T) {
+	const dc = "gpu.example.com"
+	const maxInt64 = math.MaxInt64
+
+	m := make(map[string]*api.DRAResource)
+	addDRAResource(m, dc, maxInt64, nil)
+	addDRAResource(m, dc, maxInt64, nil)
+
+	if got := m[dc].Count; got < 0 {
+		t.Fatalf("addDRAResource wrapped to a negative aggregate Count (%d) for two MaxInt64 requests; want saturated non-negative", got)
+	}
+	if got := m[dc].Count; got != maxInt64 {
+		t.Fatalf("addDRAResource Count = %d for two MaxInt64 requests; want saturated to MaxInt64 (%d)", got, maxInt64)
+	}
+}
+
+func TestUpdateJobInfoPreservesNewerTaskPlacement(t *testing.T) {
+	cached := api.NewJobInfo("job")
+	cached.TaskPlacementGeneration = 4
+	cached.AllocatedTaskPlacementGeneration = 3
+	cached.AllocatedHyperNode = "cached"
+	session := cached.Clone()
+	cached.SubJobs["sub"] = &api.SubJobInfo{UID: "sub", Job: cached.UID, AllocatedHyperNode: "cached"}
+	session.SubJobs["sub"] = &api.SubJobInfo{UID: "sub", Job: cached.UID}
+	session.AllocatedHyperNode = "session"
+	session.SubJobs["sub"].AllocatedHyperNode = "session"
+	session.AllocatedTaskPlacementGeneration = 4
+	session.AllocatedHyperNodeGeneration = 8
+	session.AllocatedHyperNodeDirty = true
+	sc := &SchedulerCache{Jobs: map[api.JobID]*api.JobInfo{cached.UID: cached}}
+
+	// An informer event arrived after the Session snapshot.
+	cached.TaskPlacementGeneration++
+	sc.updateJobInfo(session)
+	assert.Equal(t, "cached", cached.AllocatedHyperNode)
+	assert.Equal(t, "cached", cached.SubJobs["sub"].AllocatedHyperNode)
+	assert.Equal(t, uint64(3), cached.AllocatedTaskPlacementGeneration)
+	assert.Equal(t, uint64(5), cached.TaskPlacementGeneration)
+	assert.False(t, cached.AllocatedHyperNodeDirty)
+
+	// A Session from the current task version can acknowledge reconciliation.
+	session.TaskPlacementGeneration = 5
+	session.AllocatedTaskPlacementGeneration = 5
+	sc.updateJobInfo(session)
+	assert.Equal(t, "session", cached.AllocatedHyperNode)
+	assert.Equal(t, "session", cached.SubJobs["sub"].AllocatedHyperNode)
+	assert.Equal(t, uint64(5), cached.AllocatedTaskPlacementGeneration)
+	assert.Equal(t, uint64(8), cached.AllocatedHyperNodeGeneration)
+	assert.True(t, cached.AllocatedHyperNodeDirty)
+	assert.True(t, cached.Clone().AllocatedHyperNodeDirty)
+
+	session.AllocatedHyperNodeDirty = false
+	sc.updateJobInfo(session)
+	assert.False(t, cached.AllocatedHyperNodeDirty)
+}

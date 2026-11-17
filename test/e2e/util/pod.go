@@ -1,0 +1,203 @@
+/*
+Copyright 2025 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package util
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/gomega"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+)
+
+type PodSpec struct {
+	Name                          string
+	Node                          string
+	Req                           v1.ResourceList
+	Tolerations                   []v1.Toleration
+	Annotations                   map[string]string
+	Labels                        map[string]string
+	SchedulerName                 string
+	RestartPolicy                 v1.RestartPolicy
+	NodeSelector                  map[string]string
+	SchedulingGates               []v1.PodSchedulingGate
+	Image                         string
+	Command                       []string
+	TerminationGracePeriodSeconds *int64
+}
+
+func CreatePod(ctx *TestContext, spec PodSpec) *v1.Pod {
+	meta := metav1.ObjectMeta{Name: spec.Name, Namespace: ctx.Namespace}
+
+	if len(spec.Annotations) > 0 {
+		meta.Annotations = spec.Annotations
+	}
+
+	if len(spec.Labels) > 0 {
+		meta.Labels = spec.Labels
+	}
+
+	image := DefaultNginxImage
+	if spec.Image != "" {
+		image = spec.Image
+	}
+
+	container := v1.Container{
+		Image:           image,
+		Name:            spec.Name,
+		ImagePullPolicy: v1.PullIfNotPresent,
+		Resources: v1.ResourceRequirements{
+			Requests: spec.Req,
+		},
+	}
+	if len(spec.Command) > 0 {
+		container.Command = spec.Command
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: meta,
+		Spec: v1.PodSpec{
+			NodeName:      spec.Node,
+			SchedulerName: spec.SchedulerName,
+			Containers:    []v1.Container{container},
+			Tolerations:   spec.Tolerations,
+		},
+	}
+
+	if spec.SchedulerName != "" {
+		pod.Spec.SchedulerName = spec.SchedulerName
+	}
+	if spec.RestartPolicy != "" {
+		pod.Spec.RestartPolicy = spec.RestartPolicy
+	}
+	if spec.TerminationGracePeriodSeconds != nil {
+		pod.Spec.TerminationGracePeriodSeconds = spec.TerminationGracePeriodSeconds
+	}
+
+	if len(spec.NodeSelector) > 0 {
+		pod.Spec.NodeSelector = spec.NodeSelector
+	}
+
+	if len(spec.SchedulingGates) > 0 {
+		pod.Spec.SchedulingGates = spec.SchedulingGates
+	}
+
+	pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "failed to create pod %s", spec.Name)
+
+	return pod
+}
+
+func WaitPodReady(ctx *TestContext, pod *v1.Pod) error {
+	return wait.Poll(100*time.Millisecond, FiveMinute, func() (bool, error) {
+		pod, err := ctx.Kubeclient.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		return pod.Status.Phase == v1.PodRunning, nil
+	})
+}
+
+// WaitPodRecreatedAndRunning waits for a same-name replacement, not the old Pod
+// that may remain Running while its deletion is being processed.
+func WaitPodRecreatedAndRunning(ctx *TestContext, original *v1.Pod) error {
+	err := wait.PollUntilContextTimeout(context.TODO(), 100*time.Millisecond, FiveMinute, true,
+		podRecreatedAndRunning(ctx.Kubeclient.CoreV1().Pods(original.Namespace), original))
+	if err != nil {
+		return fmt.Errorf("waiting for pod %s/%s with UID %s to be replaced and running: %w",
+			original.Namespace, original.Name, original.UID, err)
+	}
+	return nil
+}
+
+func podRecreatedAndRunning(pods corev1client.PodInterface, original *v1.Pod) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		pod, err := pods.Get(ctx, original.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return pod.UID != "" && pod.UID != original.UID && pod.DeletionTimestamp == nil &&
+			pod.Spec.NodeName != "" && pod.Status.Phase == v1.PodRunning, nil
+	}
+}
+
+// WaitPodScheduled waits for a pod to have the PodScheduled condition set to True.
+func WaitPodScheduled(ctx *TestContext, namespace, podName string) error {
+	return wait.PollUntilContextTimeout(context.TODO(), 100*time.Millisecond, TwoMinute, true,
+		func(c context.Context) (bool, error) {
+			pod, err := ctx.Kubeclient.CoreV1().Pods(namespace).Get(c, podName, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == v1.PodScheduled && cond.Status == v1.ConditionTrue {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+}
+
+// WaitPodUnschedulable waits for a pod to have PodScheduled=False with the
+// Unschedulable reason set by the scheduler.
+func WaitPodUnschedulable(ctx *TestContext, namespace, podName string, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(context.TODO(), 500*time.Millisecond, timeout, true,
+		func(c context.Context) (bool, error) {
+			pod, err := ctx.Kubeclient.CoreV1().Pods(namespace).Get(c, podName, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == v1.PodScheduled &&
+					cond.Status == v1.ConditionFalse &&
+					cond.Reason == v1.PodReasonUnschedulable {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+}
+
+func DeletePod(ctx *TestContext, pod *v1.Pod) {
+	err := ctx.Kubeclient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+	Expect(err).NotTo(HaveOccurred(), "failed to delete pod %s", pod.Name)
+}
+
+// PodHasSchedulingGates returns true if the pod's scheduling gates exactly match the given list of gate names (order-independent).
+func PodHasSchedulingGates(pod *v1.Pod, gateNames ...string) bool {
+	if len(pod.Spec.SchedulingGates) != len(gateNames) {
+		return false
+	}
+	nameSet := make(map[string]bool)
+	for _, n := range gateNames {
+		nameSet[n] = true
+	}
+	for _, g := range pod.Spec.SchedulingGates {
+		if !nameSet[g.Name] {
+			return false
+		}
+	}
+	return true
+}

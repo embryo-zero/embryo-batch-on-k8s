@@ -1,0 +1,117 @@
+/*
+Copyright 2017 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"time"
+
+	"github.com/spf13/pflag"
+	"go.uber.org/automaxprocs/maxprocs"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	cliflag "k8s.io/component-base/cli/flag"
+	componentbaseoptions "k8s.io/component-base/config/options"
+	_ "k8s.io/component-base/metrics/prometheus/restclient"
+	"k8s.io/klog/v2"
+
+	"volcano.sh/volcano/cmd/controller-manager/app"
+	"volcano.sh/volcano/cmd/controller-manager/app/options"
+	_ "volcano.sh/volcano/pkg/controllers/colocationconfig"
+	_ "volcano.sh/volcano/pkg/controllers/cronjob"
+	"volcano.sh/volcano/pkg/controllers/framework"
+	_ "volcano.sh/volcano/pkg/controllers/garbagecollector"
+	_ "volcano.sh/volcano/pkg/controllers/hypernode"
+	_ "volcano.sh/volcano/pkg/controllers/job"
+	_ "volcano.sh/volcano/pkg/controllers/jobflow"
+	_ "volcano.sh/volcano/pkg/controllers/jobtemplate"
+	_ "volcano.sh/volcano/pkg/controllers/namespacequeue"
+	_ "volcano.sh/volcano/pkg/controllers/podgroup"
+	_ "volcano.sh/volcano/pkg/controllers/queue"
+	_ "volcano.sh/volcano/pkg/controllers/sharding"
+	commonutil "volcano.sh/volcano/pkg/util"
+	"volcano.sh/volcano/pkg/version"
+)
+
+var logFlushFreq = pflag.Duration("log-flush-frequency", 5*time.Second, "Maximum number of seconds between log flushes")
+
+func main() {
+	klog.InitFlags(nil)
+	// Opt into the new klog behavior so that -stderrthreshold is honored even
+	// when -logtostderr=true (the default).
+	// Ref: kubernetes/klog#212, kubernetes/klog#432
+	flag.Set("legacy_stderr_threshold_behavior", "false") //nolint:errcheck
+	flag.Set("stderrthreshold", "INFO")                   //nolint:errcheck
+
+	fs := pflag.CommandLine
+	s := options.NewServerOption()
+	// knownControllers is a list of all known controllers.
+	var knownControllers = func() []string {
+		controllerNames := []string{}
+		fn := func(controller framework.Controller) {
+			controllerNames = append(controllerNames, controller.Name())
+		}
+		framework.ForeachController(fn)
+		sort.Strings(controllerNames)
+		return controllerNames
+	}
+	s.AddFlags(fs, knownControllers())
+
+	// Register controller-specific flags for controllers that implement FlagProvider.
+	framework.ForeachController(func(controller framework.Controller) {
+		if fp, ok := controller.(framework.FlagProvider); ok {
+			fp.AddFlags(fs)
+		}
+	})
+
+	utilfeature.DefaultMutableFeatureGate.AddFlag(fs)
+
+	commonutil.LeaderElectionDefault(&s.LeaderElection)
+	s.LeaderElection.ResourceName = "vc-controller-manager"
+	componentbaseoptions.BindLeaderElectionFlags(&s.LeaderElection, fs)
+
+	cliflag.InitFlags()
+
+	if _, err := maxprocs.Set(maxprocs.Logger(klog.Infof)); err != nil {
+		klog.Errorf("Failed to set GOMAXPROCS: %v", err)
+	}
+
+	if s.PrintVersion {
+		version.PrintVersionAndExit()
+		return
+	}
+	if err := s.CheckOptionOrDie(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if s.CaCertFile != "" && s.CertFile != "" && s.KeyFile != "" {
+		if err := s.ParseCAFiles(nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse CA file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	klog.StartFlushDaemon(*logFlushFreq)
+	defer klog.Flush()
+
+	if err := app.Run(s); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}

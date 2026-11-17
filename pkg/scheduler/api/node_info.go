@@ -1,0 +1,692 @@
+/*
+ Copyright 2021 The Volcano Authors.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+*/
+
+package api
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
+
+	"volcano.sh/apis/pkg/apis/scheduling"
+	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/hami"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
+)
+
+type AllocateFailError struct {
+	Reason string
+}
+
+func (o *AllocateFailError) Error() string {
+	return o.Reason
+}
+
+type CSINodeStatusInfo struct {
+	CSINodeName  string
+	DriverStatus map[string]bool
+}
+
+// NodeInfo is node level aggregated information.
+type NodeInfo struct {
+	Name string
+	Node *v1.Node
+
+	// The state of node
+	State NodeState
+
+	// The releasing resource on that node
+	Releasing *Resource
+	// The pipelined resource on that node
+	Pipelined *Resource
+	// The idle resource on that node
+	Idle *Resource
+	// The used resource on that node, including running and terminating
+	// pods
+	Used *Resource
+
+	Allocatable   *Resource
+	Capacity      *Resource
+	ResourceUsage *NodeUsage
+
+	Tasks              map[TaskID]*TaskInfo
+	NumaInfo           *NumatopoInfo
+	UnassignedNumaPods map[PodMeta]ResNumaSets
+	NumaSchedulerInfo  *NumatopoInfo
+	RevocableZone      string
+
+	// Used to store custom information
+	Others map[string]interface{}
+	//SharedDevices map[string]SharedDevicePool
+
+	// enable node resource oversubscription
+	OversubscriptionNode bool
+	// OfflineJobEvicting true means node resource usage too high then dispatched pod can not use oversubscription resource
+	OfflineJobEvicting bool
+
+	// Resource Oversubscription feature: the Oversubscription Resource reported in annotation
+	OversubscriptionResource *Resource
+
+	// ImageStates holds the entry of an image if and only if this image is on the node. The entry can be used for
+	// checking an image's existence and advanced usage (e.g., image locality scheduling policy) based on the image
+	// state information.
+	ImageStates map[string]*fwk.ImageStateSummary
+
+	// Generation is incremented every time the cache is updated (node add/update/delete)
+	Generation int64
+
+	// BindGeneration is used to check conflict before binding
+	BindGeneration int64
+}
+
+// PodGroupOldState records podgroup old state
+type PodGroupOldState struct {
+	// Status records podgroup status during schedule
+	// This should not be mutated after initiated
+	Status map[JobID]scheduling.PodGroupStatus
+	// Annotations records old annotations for podgroup, used to detect changes
+	Annotations map[JobID]map[string]string
+}
+
+// FutureIdle returns resources that will be idle in the future:
+//
+// That is current idle resources plus released resources minus pipelined resources.
+func (ni *NodeInfo) FutureIdle() *Resource {
+	return ni.Idle.Clone().Add(ni.Releasing).SubWithoutAssert(ni.Pipelined)
+}
+
+// GetNodeAllocatable return node Allocatable without OversubscriptionResource resource
+func (ni *NodeInfo) GetNodeAllocatable() *Resource {
+	return NewResource(ni.Node.Status.Allocatable)
+}
+
+// NodeState defines the current state of node.
+type NodeState struct {
+	Phase  NodePhase
+	Reason string
+}
+
+// NodeUsage defines the real load usage of node
+type NodeUsage struct {
+	MetricsTime time.Time
+	CPUUsageAvg map[string]float64
+	MEMUsageAvg map[string]float64
+}
+
+func (nu *NodeUsage) DeepCopy() *NodeUsage {
+	newUsage := &NodeUsage{
+		CPUUsageAvg: make(map[string]float64),
+		MEMUsageAvg: make(map[string]float64),
+	}
+	newUsage.MetricsTime = nu.MetricsTime
+	for k, v := range nu.CPUUsageAvg {
+		newUsage.CPUUsageAvg[k] = v
+	}
+	for k, v := range nu.MEMUsageAvg {
+		newUsage.MEMUsageAvg[k] = v
+	}
+	return newUsage
+}
+
+// NewNodeInfo is used to create new nodeInfo object
+func NewNodeInfo(node *v1.Node) *NodeInfo {
+	nodeInfo := &NodeInfo{
+		Releasing: EmptyResource(),
+		Pipelined: EmptyResource(),
+		Idle:      EmptyResource(),
+		Used:      EmptyResource(),
+
+		Allocatable:   EmptyResource(),
+		Capacity:      EmptyResource(),
+		ResourceUsage: &NodeUsage{},
+
+		OversubscriptionResource: EmptyResource(),
+		Tasks:                    make(map[TaskID]*TaskInfo),
+
+		Others:      make(map[string]interface{}),
+		ImageStates: make(map[string]*fwk.ImageStateSummary),
+	}
+
+	nodeInfo.setOversubscription(node)
+
+	if node != nil {
+		nodeInfo.Name = node.Name
+		nodeInfo.Node = node
+		nodeInfo.Idle = NewResource(node.Status.Allocatable).Add(nodeInfo.OversubscriptionResource)
+		nodeInfo.Allocatable = NewResource(node.Status.Allocatable).Add(nodeInfo.OversubscriptionResource)
+		nodeInfo.Capacity = NewResource(node.Status.Capacity).Add(nodeInfo.OversubscriptionResource)
+	}
+	nodeInfo.setNodeOthersResource(node)
+	nodeInfo.setNodeState(node)
+	nodeInfo.setRevocableZone(node)
+
+	return nodeInfo
+}
+
+// RefreshNumaSchedulerInfoByCrd used to update scheduler numa information based the numatopo CRD
+func (ni *NodeInfo) RefreshNumaSchedulerInfoByCrd() {
+	if ni.NumaInfo == nil {
+		ni.NumaSchedulerInfo = nil
+		klog.V(5).Infof("set numa scheduler info of node %s to nil", ni.Name)
+		return
+	}
+	klog.V(5).Infof("numa info of node %s is %v", ni.Name, ni.NumaInfo)
+
+	unassignedNumber := 0
+	for podMeta, resSets := range ni.UnassignedNumaPods {
+		if !ni.NumaInfo.CheckNumaPodAssigned(podMeta) {
+			klog.V(3).Infof("pod %v is scheduled to node %s, but has not been assigned numa resources, will pre-occupy resources %v", podMeta, ni.Name, resSets)
+			unassignedNumber++
+		}
+	}
+
+	tmp := ni.NumaInfo.DeepCopy()
+	// Only clear UnassignedNumaPods when every entry has been assigned, because volcano's allocation decision may differ from kubelet's.
+	// Otherwise, volcano may lose some allocation info and dispatch a pod that kubelet rejects with TopologyAffinityError.
+	if unassignedNumber == 0 {
+		ni.UnassignedNumaPods = nil
+	} else {
+		for podMeta, resSets := range ni.UnassignedNumaPods {
+			klog.V(3).Infof("because of the presence of unassigned %d pods, pod %v still pre-occupies resources %v on node %s", unassignedNumber, podMeta, resSets, ni.Name)
+			tmp.Allocate(resSets)
+		}
+	}
+	ni.NumaSchedulerInfo = tmp
+}
+
+// Clone used to clone nodeInfo Object
+func (ni *NodeInfo) Clone() *NodeInfo {
+	res := NewNodeInfo(ni.Node)
+
+	for _, p := range ni.Tasks {
+		res.AddTask(p)
+	}
+	if ni.NumaInfo != nil {
+		res.NumaInfo = ni.NumaInfo.DeepCopy()
+	}
+	if ni.ResourceUsage != nil {
+		res.ResourceUsage = ni.ResourceUsage.DeepCopy()
+	}
+
+	if ni.UnassignedNumaPods != nil {
+		res.UnassignedNumaPods = make(map[PodMeta]ResNumaSets, len(ni.UnassignedNumaPods))
+		for podMeta, resSets := range ni.UnassignedNumaPods {
+			res.UnassignedNumaPods[podMeta] = resSets.Clone()
+		}
+	}
+	if ni.NumaSchedulerInfo != nil {
+		res.NumaSchedulerInfo = ni.NumaSchedulerInfo.DeepCopy()
+		klog.V(5).Infof("node[%s]", ni.Name)
+		for resName, resInfo := range res.NumaSchedulerInfo.NumaResMap {
+			klog.V(5).Infof("current resource %s : %v", resName, resInfo)
+		}
+
+		klog.V(5).Infof("current Policies : %v", res.NumaSchedulerInfo.Policies)
+	}
+
+	klog.V(5).Infof("imageStates is %v", res.ImageStates)
+
+	res.Others = ni.CloneOthers()
+	res.ImageStates = ni.CloneImageSummary()
+	res.BindGeneration = ni.BindGeneration
+	return res
+}
+
+// Ready returns whether node is ready for scheduling
+func (ni *NodeInfo) Ready() bool {
+	return ni.State.Phase == Ready
+}
+
+func (ni *NodeInfo) setRevocableZone(node *v1.Node) {
+	if node == nil {
+		klog.Warningf("the argument node is null.")
+		return
+	}
+
+	revocableZone := ""
+	if len(node.Labels) > 0 {
+		if value, found := node.Labels[v1beta1.RevocableZone]; found {
+			revocableZone = value
+		}
+	}
+	ni.RevocableZone = revocableZone
+}
+
+// Check node if enable Oversubscription and set Oversubscription resources
+// Only support oversubscription cpu and memory resource for this version
+func (ni *NodeInfo) setOversubscription(node *v1.Node) {
+	if node == nil {
+		return
+	}
+
+	ni.OversubscriptionNode = false
+	ni.OfflineJobEvicting = false
+	if len(node.Labels) > 0 {
+		if value, found := node.Labels[OversubscriptionNode]; found {
+			b, err := strconv.ParseBool(value)
+			if err == nil {
+				ni.OversubscriptionNode = b
+			} else {
+				ni.OversubscriptionNode = false
+			}
+			klog.V(5).Infof("Set node %s Oversubscription to %v", node.Name, ni.OversubscriptionNode)
+		}
+	}
+
+	if len(node.Annotations) > 0 {
+		if value, found := node.Annotations[OfflineJobEvicting]; found {
+			b, err := strconv.ParseBool(value)
+			if err == nil {
+				ni.OfflineJobEvicting = b
+			} else {
+				ni.OfflineJobEvicting = false
+			}
+			klog.V(5).Infof("Set node %s OfflineJobEvicting to %v", node.Name, ni.OfflineJobEvicting)
+		}
+	}
+	ni.OversubscriptionResource = nodeOversubscriptionResource(node)
+	klog.V(5).Infof("Set node %s Oversubscription resource to %v", node.Name, ni.OversubscriptionResource)
+}
+
+// NewNodeAllocatable returns the Node resources used by Volcano's built-in
+// resource-fit check, including legacy CPU and memory oversubscription
+// annotations.
+func NewNodeAllocatable(node *v1.Node) *Resource {
+	if node == nil {
+		return EmptyResource()
+	}
+	return NewResource(node.Status.Allocatable).Add(nodeOversubscriptionResource(node))
+}
+
+func nodeOversubscriptionResource(node *v1.Node) *Resource {
+	resource := EmptyResource()
+	if node == nil {
+		return resource
+	}
+	if value, found := node.Annotations[OversubscriptionCPU]; found {
+		resource.MilliCPU, _ = strconv.ParseFloat(value, 64)
+	}
+	if value, found := node.Annotations[OversubscriptionMemory]; found {
+		resource.Memory, _ = strconv.ParseFloat(value, 64)
+	}
+	return resource
+}
+
+func (ni *NodeInfo) setNodeState(node *v1.Node) {
+	// If node is nil, the node is un-initialized in cache
+	if node == nil {
+		ni.State = NodeState{
+			Phase:  NotReady,
+			Reason: "UnInitialized",
+		}
+		return
+	}
+
+	// set NodeState according to resources
+	if ok, resources := ni.Used.LessEqualWithResourcesName(ni.Allocatable, Zero); !ok {
+		klog.ErrorS(nil, "Node out of sync", "name", ni.Name, "resources", resources)
+	}
+
+	// Node is ready (ignore node conditions because of taint/toleration), for more detail please see
+	// https://github.com/kubernetes/design-proposals-archive/blob/main/scheduling/taint-node-by-condition.md.
+	ni.State = NodeState{
+		Phase:  Ready,
+		Reason: "",
+	}
+}
+
+// SetNode sets kubernetes node object to nodeInfo object
+func (ni *NodeInfo) SetNode(node *v1.Node) {
+	ni.setNodeState(node)
+	if !ni.Ready() {
+		klog.Warningf("Failed to set node info for %s, phase: %s, reason: %s",
+			ni.Name, ni.State.Phase, ni.State.Reason)
+		return
+	}
+	ni.setNode(node)
+}
+
+// setNodeOthersResource initialize sharable devices
+func (ni *NodeInfo) setNodeOthersResource(node *v1.Node) {
+	if node == nil {
+		klog.Warningf("received argument of nil node, no need to set other resources for %s", ni.Name)
+		return
+	}
+	ignored_list := []string{}
+	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
+		gpuDevices := gpushare.NewGPUDevices(ni.Name, node)
+		if gpuDevices != nil {
+			ni.Others[gpushare.DeviceName] = gpuDevices
+			ignored_list = append(ignored_list, gpuDevices.GetIgnoredDevices()...)
+		} else {
+			delete(ni.Others, gpushare.DeviceName)
+		}
+	}
+	if vgpu.VGPUEnable {
+		gpuDevices := vgpu.NewGPUDevices(ni.Name, node)
+		if gpuDevices != nil {
+			ni.Others[vgpu.DeviceName] = gpuDevices
+			ignored_list = append(ignored_list, gpuDevices.GetIgnoredDevices()...)
+		} else {
+			delete(ni.Others, vgpu.DeviceName)
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		ni.Others[vnpu.DeviceName] = vnpu.NewNPUDevices(ni.Name, node)
+		ignored_list = append(ignored_list, vnpu.NewNPUDevices(ni.Name, node).GetIgnoredDevices()...)
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for deviceName, devices := range hami.NewAscendDevices(ni.Name, node) {
+			ni.Others[deviceName] = devices
+			ignored_list = append(ignored_list, devices.GetIgnoredDevices()...)
+		}
+	}
+	klog.V(5).Infof("ignored_list is %v", ignored_list)
+	IgnoredDevicesList.AppendList(
+		ignored_list,
+	)
+	klog.V(5).Infof("ignoredDevicesList is %v", IgnoredDevicesList.List())
+}
+
+// setNode sets kubernetes node object to nodeInfo object without assertion
+func (ni *NodeInfo) setNode(node *v1.Node) {
+	ni.Name = node.Name
+	ni.Node = node
+
+	ni.setOversubscription(node)
+	ni.setRevocableZone(node)
+	ni.setNodeOthersResource(node)
+
+	ni.Allocatable = NewResource(node.Status.Allocatable).Add(ni.OversubscriptionResource)
+	ni.Capacity = NewResource(node.Status.Capacity).Add(ni.OversubscriptionResource)
+	ni.Releasing = EmptyResource()
+	ni.Pipelined = EmptyResource()
+	ni.Idle = NewResource(node.Status.Allocatable).Add(ni.OversubscriptionResource)
+	ni.Used = EmptyResource()
+
+	for _, ti := range ni.Tasks {
+		switch ti.Status {
+		case Releasing:
+			ni.allocateIdleResource(ti)
+			ni.Releasing.Add(ti.Resreq)
+			ni.Used.Add(ti.Resreq)
+		case Pipelined:
+			ni.Pipelined.Add(ti.Resreq)
+		default:
+			ni.allocateIdleResource(ti)
+			ni.Used.Add(ti.Resreq)
+			ni.addResource(ti.Pod)
+		}
+	}
+}
+
+func (ni *NodeInfo) allocateIdleResource(ti *TaskInfo) {
+	ok, resources := ti.Resreq.LessEqualWithResourcesName(ni.Idle, Zero)
+	if ok {
+		ni.Idle.sub(ti.Resreq)
+		return
+	}
+
+	ni.Idle.sub(ti.Resreq)
+	klog.ErrorS(nil, "Idle resources turn into negative after allocated",
+		"nodeName", ni.Name, "task", klog.KObj(ti.Pod), "resources", resources, "idle", ni.Idle.String(), "req", ti.Resreq.String())
+}
+
+// AddTask is used to add a task in nodeInfo object
+//
+// If error occurs both task and node are guaranteed to be in the original state.
+func (ni *NodeInfo) AddTask(task *TaskInfo) error {
+	if len(task.NodeName) > 0 && len(ni.Name) > 0 && task.NodeName != ni.Name {
+		return fmt.Errorf("task <%v/%v> already on different node <%v>",
+			task.Namespace, task.Name, task.NodeName)
+	}
+
+	key := PodKey(task.Pod)
+	if _, found := ni.Tasks[key]; found {
+		return fmt.Errorf("task <%v/%v> already on node <%v>",
+			task.Namespace, task.Name, ni.Name)
+	}
+
+	// Node will hold a copy of task to make sure the status
+	// change will not impact resource in node.
+	ti := task.Clone()
+
+	if ni.Node != nil {
+		switch ti.Status {
+		case Releasing:
+			ni.allocateIdleResource(ti)
+			ni.Releasing.Add(ti.Resreq)
+			ni.Used.Add(ti.Resreq)
+		case Pipelined:
+			ni.Pipelined.Add(ti.Resreq)
+		case Binding:
+			// When task in Binding status, it will bind to node, we should double-check whether idle resources are enough to put task before bind to apiserver.
+			if ok, resNames := ti.Resreq.LessEqualWithResourcesName(ni.Idle, Zero); !ok {
+				return fmt.Errorf("node %s resources %v are not enough to put task <%s/%s>, idle: %s, req: %s", ni.Name, resNames, ti.Namespace, ti.Name, ni.Idle.String(), ti.Resreq.String())
+			}
+			ni.allocateIdleResource(ti)
+			ni.Used.Add(ti.Resreq)
+			ni.addResource(ti.Pod)
+		default:
+			ni.allocateIdleResource(ti)
+			ni.Used.Add(ti.Resreq)
+			ni.addResource(ti.Pod)
+		}
+	}
+
+	// Update task node name upon successful task addition.
+	task.NodeName = ni.Name
+	ti.NodeName = ni.Name
+	ni.Tasks[key] = ti
+
+	return nil
+}
+
+// RemoveTask used to remove a task from nodeInfo object.
+func (ni *NodeInfo) RemoveTask(ti *TaskInfo) {
+	key := PodKey(ti.Pod)
+
+	task, found := ni.Tasks[key]
+	if !found {
+		klog.Warningf("failed to find task <%v/%v> on host <%v>",
+			ti.Namespace, ti.Name, ni.Name)
+		return
+	}
+
+	if ni.Node != nil {
+		switch task.Status {
+		case Releasing:
+			ni.Releasing.Sub(task.Resreq)
+			ni.Idle.Add(task.Resreq)
+			ni.Used.Sub(task.Resreq)
+		case Pipelined:
+			ni.Pipelined.Sub(task.Resreq)
+		default:
+			ni.Idle.Add(task.Resreq)
+			ni.Used.Sub(task.Resreq)
+			ni.subResource(ti.Pod)
+		}
+	}
+
+	delete(ni.Tasks, key)
+}
+
+// addResource is used to add sharable devices
+func (ni *NodeInfo) addResource(pod *v1.Pod) {
+	// In the upgrade scenario from volcano1.7+volcano-device-plugin to volcano1.12+hami-device-plugin (with VGPUEnable),
+	// pods scheduled by volcano 1.7 and using the volcano.sh/gpu-number resource will cause the scheduler pod in volcano 1.12 to panic
+	// at dev := gs.Device[id] ,where gs.Device is nil.
+
+	// Add an if judgment condition to fix the panic.
+	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
+		if other, exists := ni.Others[gpushare.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
+	}
+	if vgpu.VGPUEnable {
+		if other, exists := ni.Others[vgpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		if other, exists := ni.Others[vnpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for _, name := range hami.GetAscendDeviceNames() {
+			if other, exists := ni.Others[name]; exists {
+				if devices, ok := other.(Devices); ok {
+					devices.AddResource(pod)
+				}
+			}
+		}
+	}
+}
+
+// subResource is used to subtract sharable devices
+func (ni *NodeInfo) subResource(pod *v1.Pod) {
+	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
+		if other, exists := ni.Others[gpushare.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
+	}
+	if vgpu.VGPUEnable {
+		if other, exists := ni.Others[vgpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		if other, exists := ni.Others[vnpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for _, name := range hami.GetAscendDeviceNames() {
+			if other, exists := ni.Others[name]; exists {
+				if devices, ok := other.(Devices); ok {
+					devices.SubResource(pod)
+				}
+			}
+		}
+	}
+}
+
+// UpdateTask is used to update a task in nodeInfo object.
+func (ni *NodeInfo) UpdateTask(ti *TaskInfo) {
+	ni.RemoveTask(ti)
+	if err := ni.AddTask(ti); err != nil {
+		// This should never happen if task removal was successful,
+		// because only possible error during task addition is when task is still on a node.
+		klog.Fatalf("Failed to add Task <%s,%s> to Node <%s> during task update",
+			ti.Namespace, ti.Name, ni.Name)
+	}
+}
+
+// String returns nodeInfo details in string format
+func (ni NodeInfo) String() string {
+	var b strings.Builder
+
+	i := 0
+	for _, task := range ni.Tasks {
+		fmt.Fprintf(&b, "\n\t %d: %v", i, task)
+		i++
+	}
+
+	var taints []v1.Taint
+	if ni.Node != nil {
+		taints = ni.Node.Spec.Taints
+	}
+
+	return fmt.Sprintf("Node (%s): allocatable<%v> idle <%v>, used <%v>, releasing <%v>, oversubscribution <%v>, "+
+		"state <phase %s, reaseon %s>, oversubscributionNode <%v>, offlineJobEvicting <%v>,taints <%v>%s, imageStates %v",
+		ni.Name, ni.Allocatable, ni.Idle, ni.Used, ni.Releasing, ni.OversubscriptionResource, ni.State.Phase, ni.State.Reason, ni.OversubscriptionNode, ni.OfflineJobEvicting, taints, b.String(), ni.ImageStates)
+}
+
+// Pods returns all pods running in that node
+func (ni *NodeInfo) Pods() (pods []*v1.Pod) {
+	for _, t := range ni.Tasks {
+		pods = append(pods, t.Pod)
+	}
+
+	return
+}
+
+// CloneImageSummary Clone Image State
+func (ni *NodeInfo) CloneImageSummary() map[string]*fwk.ImageStateSummary {
+	nodeImageStates := make(map[string]*fwk.ImageStateSummary)
+	for imageName, summary := range ni.ImageStates {
+		newImageSummary := &fwk.ImageStateSummary{
+			Size:     summary.Size,
+			NumNodes: summary.NumNodes,
+		}
+		nodeImageStates[imageName] = newImageSummary
+	}
+	return nodeImageStates
+}
+
+// CloneOthers clone other map resources using deepcopy
+func (ni *NodeInfo) CloneOthers() map[string]interface{} {
+	others := make(map[string]interface{})
+	for k, v := range ni.Others {
+		if d, ok := v.(Devices); ok {
+			if IsNilDevice(d) {
+				others[k] = v
+				continue
+			}
+			others[k] = d.DeepCopy()
+		} else {
+			others[k] = v
+		}
+	}
+	return others
+}
+
+func (ni *NodeInfo) NextBindGeneration() {
+	atomic.AddInt64(&ni.BindGeneration, 1)
+}
+
+// Clone clone csi node status info
+func (cs *CSINodeStatusInfo) Clone() *CSINodeStatusInfo {
+	newcs := &CSINodeStatusInfo{
+		CSINodeName:  cs.CSINodeName,
+		DriverStatus: make(map[string]bool),
+	}
+	for k, v := range cs.DriverStatus {
+		newcs.DriverStatus[k] = v
+	}
+	return newcs
+}

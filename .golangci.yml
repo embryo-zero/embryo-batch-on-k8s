@@ -1,0 +1,90 @@
+# REQUIRED for golangci-lint v2 configuration format
+version: "2"
+
+run:
+  concurrency: 4
+  timeout: 10m
+  issues-exit-code: 1
+
+linters:
+  default: none
+  enable:
+    - govet
+    - depguard
+    - ineffassign
+    - staticcheck
+    - unused
+    - whitespace
+  
+  settings:
+    goimports:
+      local-prefixes:
+        - volcano.sh
+    staticcheck:
+      checks:
+        - "all"
+        - "-SA1019" # Using a deprecated function, variable, constant or field
+        - "-ST1000" # Incorrect or missing package comment
+        - "-ST1003" # Poorly chosen identifier name (e.g. underscores in Go names)
+        - "-ST1005" # Error strings should not be capitalized or end with punctuation
+        - "-ST1012" # Poorly chosen name for error variable
+        - "-ST1016" # Methods on the same type should have the same receiver name
+        - "-ST1019" # Import the same package multiple times
+        - "-ST1020" # The documentation of an exported function should start with function's name
+        - "-ST1021" # The documentation of an exported type should start with type's name
+        - "-QF1001" # Apply De Morgan's law
+        - "-QF1003" # Convert if/else-if chain to tagged switch
+        - "-QF1004" # Use strings.ReplaceAll instead of strings.Replace with -1
+        - "-QF1006" # Lift post-condition loop into loop condition
+        - "-QF1007" # Merge conditional assignment into variable declaration
+        - "-QF1008" # Omit embedded fields from selector
+        - "-QF1011" # Redundant type declaration
+        - "-SA1006" # printf-style function with dynamic format string and no further arguments
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: "k8s.io/klog$"
+              desc: "k8s.io/klog is deprecated, use k8s.io/klog/v2 instead"
+            - pkg: "io/ioutil"
+              desc: "replaced by io and os packages since Go 1.16: https://tip.golang.org/doc/go1.16#ioutil"
+
+  exclusions:
+    presets:
+      - comments
+      - legacy
+      - std-error-handling
+      - common-false-positives
+    paths:
+      - vendor
+      - test
+      - example
+      - third_party
+    rules:
+      # Match v1's skip-files: .*_test.go
+      - path: ".*_test.go"
+        linters:
+          - all
+
+output:
+  formats:
+    colored-line-number: {}
+  print-issued-lines: true
+  print-linter-name: true
+  # make issues output unique by line
+  uniq-by-line: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - volcano.sh
+  exclusions:
+    paths:
+      - vendor
+      - test
+      - example
+      - third_party

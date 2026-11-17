@@ -1,0 +1,187 @@
+/*
+ Copyright 2023 The Volcano Authors.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+*/
+
+package api
+
+import (
+	"reflect"
+	"slices"
+	"sync"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"volcano.sh/volcano/pkg/scheduler/api/devices"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/hami"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
+)
+
+type Devices interface {
+	//following two functions used in node_info
+	//AddResource is to add the corresponding device resource of this 'pod' into current scheduler cache
+	AddResource(pod *v1.Pod)
+	//SubResource is to subtract the corresponding device resource of this 'pod' from current scheduler cache
+	SubResource(pod *v1.Pod)
+	//AddQueueResource is to override the corresponding resources to queue.allocated
+	AddQueueResource(pod *v1.Pod) map[string]float64
+	//following four functions used in predicate
+	//HasDeviceRequest checks if the 'pod' request this device
+	HasDeviceRequest(pod *v1.Pod) bool
+	// FilterNode checks if the 'pod' fit in current node
+	// The first return value represents the filtering result, and the value range is "0, 1, 2, 3"
+	// 0: Success
+	// Success means that plugin ran correctly and found pod schedulable.
+
+	// 1: Error
+	// Error is used for internal plugin errors, unexpected input, etc.
+
+	// 2: Unschedulable
+	// Unschedulable is used when a plugin finds a pod unschedulable. The scheduler might attempt to
+	// preempt other pods to get this pod scheduled. Use UnschedulableAndUnresolvable to make the
+	// scheduler skip preemption.
+	// The accompanying status message should explain why the pod is unschedulable.
+
+	// 3: UnschedulableAndUnresolvable
+	// UnschedulableAndUnresolvable is used when a plugin finds a pod unschedulable and
+	// preemption would not change anything. Plugins should return Unschedulable if it is possible
+	// that the pod can get scheduled with preemption.
+	// The accompanying status message should explain why the pod is unschedulable.
+	FilterNode(pod *v1.Pod, policy string) (int, string, error)
+	// ScoreNode will be invoked when using devicescore plugin, devices api can use it to implement multiple
+	// scheduling policies.
+	ScoreNode(pod *v1.Pod, policy string) float64
+
+	// Allocate action in predicate.
+	// Returns the reservation data produced by this allocation, including annotations
+	// that need to be carried during binding. Implementations that do not need bind
+	// annotations may return (nil, nil).
+	Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error)
+
+	// Release action in predicate.
+	// Rolls back the in-memory ledger and optionally returns annotation keys that
+	// should be removed from TaskInfo.PodAnnotations. The implementation owns any
+	// apiserver-side annotation cleanup it performs.
+	Release(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error)
+
+	// GetIgnoredDevices notify vc-scheduler to ignore devices in return list
+	GetIgnoredDevices() []string
+
+	// GetStatus used for debug and monitor
+	GetStatus() string
+
+	// DeepCopy returns a deep copy of this device object for use in dry-run
+	// simulation (e.g. topology-aware preemption).  The return type is
+	// interface{} to avoid circular imports: each device package does not
+	// import the top-level api package.
+	DeepCopy() interface{}
+}
+
+// make sure GPUDevices implements Devices interface
+var _ Devices = new(gpushare.GPUDevices)
+var _ Devices = new(vgpu.GPUDevices)
+var _ Devices = new(vnpu.NPUDevices)
+var _ Devices = new(hami.AscendDevices)
+
+var RegisteredDevices = []string{}
+
+func RegisterDevice(deviceName string) {
+	for _, name := range RegisteredDevices {
+		if name == deviceName {
+			return
+		}
+	}
+	RegisteredDevices = append(RegisteredDevices, deviceName)
+}
+
+// IsNilDevice reports whether d wraps a typed-nil pointer.
+func IsNilDevice(d Devices) bool {
+	rv := reflect.ValueOf(d)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
+}
+
+var IgnoredDevicesList = ignoredDevicesList{}
+
+type ignoredDevicesList struct {
+	sync.RWMutex
+	ignoredDevices []string
+}
+
+func (l *ignoredDevicesList) Set(deviceLists ...[]string) {
+	l.Lock()
+	defer l.Unlock()
+	l.ignoredDevices = l.ignoredDevices[:0]
+	for _, devices := range deviceLists {
+		for _, device := range devices {
+			if device == "" {
+				continue
+			}
+			if exists := slices.Contains(l.ignoredDevices, device); exists {
+				continue
+			}
+			l.ignoredDevices = append(l.ignoredDevices, device)
+		}
+	}
+}
+
+func (l *ignoredDevicesList) Append(devices ...string) {
+	l.Lock()
+	defer l.Unlock()
+	for _, device := range devices {
+		if device == "" {
+			continue
+		}
+		if exists := slices.Contains(l.ignoredDevices, device); exists {
+			continue
+		}
+		l.ignoredDevices = append(l.ignoredDevices, device)
+	}
+}
+
+func (l *ignoredDevicesList) AppendList(devicesLists ...[]string) {
+	l.Lock()
+	defer l.Unlock()
+	for _, devices := range devicesLists {
+		for _, device := range devices {
+			if device == "" {
+				continue
+			}
+			if exists := slices.Contains(l.ignoredDevices, device); exists {
+				continue
+			}
+			l.ignoredDevices = append(l.ignoredDevices, device)
+		}
+	}
+}
+
+func (l *ignoredDevicesList) Range(f func(i int, device string) bool) {
+	l.RLock()
+	defer l.RUnlock()
+	for i, device := range l.ignoredDevices {
+		if !f(i, device) {
+			break
+		}
+	}
+}
+
+func (l *ignoredDevicesList) List() []string {
+	l.RLock()
+	defer l.RUnlock()
+	devices := make([]string, len(l.ignoredDevices))
+	copy(devices, l.ignoredDevices)
+	return devices
+}

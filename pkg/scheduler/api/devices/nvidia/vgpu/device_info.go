@@ -1,0 +1,405 @@
+/*
+Copyright 2023 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package vgpu
+
+import (
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+
+	"volcano.sh/volcano/pkg/scheduler/api/devices"
+	deviceconfig "volcano.sh/volcano/pkg/scheduler/api/devices/config"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util/nodelock"
+)
+
+type GPUUsage struct {
+	UsedMem     uint
+	UsedCore    uint
+	PodGroupKey string // namespace/name of PodGroup, or "" if pod has no group
+}
+
+// GPUDevice include gpu id, memory and the pods that are sharing it.
+type GPUDevice struct {
+	// GPU ID
+	ID int
+	// Node this GPU Device belongs
+	Node string
+	// GPU Unique ID
+	UUID string
+	// The resource usage by pods that are sharing this GPU
+	PodMap map[string]*GPUUsage
+	// memory per card
+	Memory uint
+	// max sharing number
+	Number uint
+	// type of this number
+	Type string
+	// Health condition of this GPU
+	Health bool
+	// number of allocated
+	UsedNum uint
+	// number of device memory allocated
+	UsedMem uint
+	// number of core used
+	UsedCore uint
+	// MigTemplate for this GPU
+	MigTemplate []deviceconfig.Geometry
+	/// MigUsage for this GPU
+	MigUsage deviceconfig.MigInUse
+}
+
+type GPUDevices struct {
+	Name string
+	// Mode GPU sharing mode
+	Mode string
+	// We cache score in filter step according to schedulePolicy, to avoid recalculating in score
+	Score float64
+
+	Device map[int]*GPUDevice
+	// Sharing sharing handler
+	Sharing SharingFactory
+}
+
+// NewGPUDevice creates a device
+func NewGPUDevice(id int, mem uint) *GPUDevice {
+	return &GPUDevice{
+		ID:       id,
+		Memory:   mem,
+		PodMap:   make(map[string]*GPUUsage),
+		UsedNum:  0,
+		UsedMem:  0,
+		UsedCore: 0,
+	}
+}
+
+func NewGPUDevices(name string, node *v1.Node) *GPUDevices {
+	if node == nil {
+		return nil
+	}
+	annos, ok := node.Annotations[deviceconfig.VolcanoVGPURegister]
+	if !ok {
+		return nil
+	}
+
+	if node.Status.Allocatable != nil {
+		gpuNumberRes, gpuNumberExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUNumber)]
+		if !gpuNumberExists || gpuNumberRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUNumber)
+			return nil
+		}
+
+		vgpuCoresRes, vgpuCoresExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUCores)]
+		if !vgpuCoresExists || vgpuCoresRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUCores)
+			return nil
+		}
+
+		vgpuMemoryRes, vgpuMemoryExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUMemory)]
+		if !vgpuMemoryExists || vgpuMemoryRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUMemory)
+			return nil
+		}
+	} else {
+		klog.V(3).Infof("Node %s does not have allocatable resources information, returning nil", node.Name)
+		return nil
+	}
+
+	nodedevices, sharingMode := decodeNodeDevices(name, annos)
+	if (nodedevices == nil) || len(nodedevices.Device) == 0 {
+		return nil
+	}
+
+	sharingHandler, _ := GetSharingHandler(sharingMode)
+	klog.V(3).Infoln("GPU sharing mode: ", sharingMode)
+	for _, val := range nodedevices.Device {
+		klog.V(3).InfoS("Nvidia Device registered name", "name", nodedevices.Name, "val", *val)
+		ResetDeviceMetrics(val.UUID, node.Name, float64(val.Memory))
+	}
+
+	nodedevices.Sharing = sharingHandler
+	return nodedevices
+}
+
+func (gs *GPUDevices) ScoreNode(pod *v1.Pod, schedulePolicy string) float64 {
+	/* TODO: we need a base score to be campatable with preemption, it means a node without evicting a task has
+	   a higher score than those needs to evict a task */
+
+	// Use cached stored in filter state in order to avoid recalculating.
+	return gs.Score
+}
+
+func (gs *GPUDevices) GetIgnoredDevices() []string {
+	return []string{}
+}
+
+func (gs *GPUDevices) AddQueueResource(pod *v1.Pod) map[string]float64 {
+	if gs == nil {
+		return map[string]float64{}
+	}
+	klog.V(5).InfoS("AddQueueResource", "Name", pod.Name)
+	res := map[string]float64{}
+	ids, ok := pod.Annotations[AssignedIDsAnnotations]
+	if !ok {
+		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
+		return res
+	}
+	podDev := DecodePodDevices(ids)
+	for _, val := range podDev {
+		for _, deviceused := range val {
+			for _, gsdevice := range gs.Device {
+				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
+					res[getConfig().ResourceMemoryName] += float64(deviceused.Usedmem * 1000)
+					res[getConfig().ResourceCoreName] += float64(deviceused.Usedcores * 1000)
+				}
+			}
+		}
+	}
+	klog.V(4).InfoS("AddQueueResource", "Name=", pod.Name, "res=", res)
+	return res
+}
+
+// AddResource adds the pod to GPU pool if it is assigned
+func (gs *GPUDevices) AddResource(pod *v1.Pod) {
+	if gs == nil {
+		return
+	}
+
+	gs.addResource(pod.Annotations, pod)
+}
+
+func (gs *GPUDevices) addResource(annotations map[string]string, pod *v1.Pod) {
+	ids, ok := annotations[AssignedIDsAnnotations]
+	if !ok {
+		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
+		return
+	}
+	podDev := DecodePodDevices(ids)
+	for _, val := range podDev {
+		for _, deviceused := range val {
+			for index, gsdevice := range gs.Device {
+				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
+					err := gs.Sharing.AddPod(gsdevice, deviceused.Usedmem, deviceused.Usedcores, string(pod.UID), deviceused.UUID)
+					if err == nil {
+						if u := gsdevice.PodMap[string(pod.UID)]; u != nil {
+							u.PodGroupKey = getPodGroupKey(pod)
+						}
+						gs.AddPodMetrics(index, string(pod.UID), pod.Name)
+					} else {
+						klog.ErrorS(err, "add resource failed")
+					}
+					break
+				}
+			}
+		}
+	}
+}
+
+func (gs *GPUDevices) addToPodMap(annotations map[string]string, pod *v1.Pod) {
+	ids, ok := annotations[AssignedIDsAnnotations]
+	if !ok {
+		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
+		return
+	}
+	podDev := DecodePodDevices(ids)
+	for _, val := range podDev {
+		for _, deviceused := range val {
+			for _, gsdevice := range gs.Device {
+				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
+					podUID := string(pod.UID)
+					_, ok := gsdevice.PodMap[podUID]
+					if !ok {
+						gsdevice.PodMap[podUID] = &GPUUsage{
+							UsedMem:     0,
+							UsedCore:    0,
+							PodGroupKey: getPodGroupKey(pod),
+						}
+					}
+
+					gsdevice.PodMap[podUID].UsedMem += deviceused.Usedmem
+					gsdevice.PodMap[podUID].UsedCore += deviceused.Usedcores
+					gsdevice.PodMap[podUID].PodGroupKey = getPodGroupKey(pod)
+				}
+			}
+		}
+	}
+}
+
+// SubResource frees the gpu hold by the pod
+func (gs *GPUDevices) SubResource(pod *v1.Pod) {
+	if gs == nil {
+		return
+	}
+	ids, ok := pod.Annotations[AssignedIDsAnnotations]
+	if !ok {
+		return
+	}
+	podDev := DecodePodDevices(ids)
+	for _, val := range podDev {
+		for _, deviceused := range val {
+			for index, gsdevice := range gs.Device {
+				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
+					err := gs.Sharing.SubPod(gsdevice, uint(deviceused.Usedmem), uint(deviceused.Usedcores), string(pod.UID), deviceused.UUID)
+					if err != nil {
+						klog.ErrorS(err, "sub resource failed")
+					} else {
+						gs.SubPodMetrics(index, string(pod.UID), pod.Name)
+					}
+					break
+				}
+			}
+		}
+	}
+}
+
+func (gs *GPUDevices) HasDeviceRequest(pod *v1.Pod) bool {
+	if VGPUEnable && checkVGPUResourcesInPod(pod) {
+		return true
+	}
+	return false
+}
+
+func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error) {
+	if gs == nil || pod == nil {
+		return nil, nil
+	}
+	// Roll back the in-memory device ledger for UnPipeline/UnAllocate paths.
+	gs.SubResource(pod)
+
+	// Once binding succeeds, vgpu-device-plugin owns these annotations.
+	// The scheduler must not clean them again.
+	if pod.Annotations != nil && pod.Annotations[DeviceBindPhase] == "success" {
+		return nil, nil
+	}
+
+	keys := []string{
+		AssignedNodeAnnotations,          // volcano.sh/vgpu-node
+		AssignedIDsAnnotations,           // volcano.sh/vgpu-ids-new
+		AssignedIDsToAllocateAnnotations, // volcano.sh/devices-to-allocate
+		AssignedTimeAnnotations,          // volcano.sh/vgpu-time
+		BindTimeAnnotations,              // volcano.sh/bind-time
+		DeviceBindPhase,                  // volcano.sh/bind-phase
+	}
+	return &devices.DeviceReservation{
+		DeviceType:  DeviceName,
+		Annotations: devices.AnnotationKeyMap(keys),
+	}, nil
+}
+
+func (gs *GPUDevices) FilterNode(pod *v1.Pod, schedulePolicy string) (int, string, error) {
+	if VGPUEnable {
+		klog.V(4).Infoln("hami-vgpu DeviceSharing starts filtering pods", pod.Name)
+		fit, _, score, err := checkNodeGPUSharingPredicateAndScore(pod, gs, true, schedulePolicy)
+		if err != nil || !fit {
+			klog.ErrorS(err, "Failed to fitler node to vgpu task", "pod", pod.Name)
+			return devices.Unschedulable, "hami-vgpuDeviceSharing error", err
+		}
+		gs.Score = score
+		klog.V(4).Infoln("hami-vgpu DeviceSharing successfully filters pods")
+	}
+	return devices.Success, "", nil
+}
+
+func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error) {
+	if !VGPUEnable {
+		return nil, nil
+	}
+	klog.V(4).Infoln("hami-vgpu DeviceSharing:Into AllocateToPod", pod.Name)
+	fit, device, _, err := checkNodeGPUSharingPredicateAndScore(pod, gs, false, SchedulePolicy)
+	if err != nil || !fit {
+		klog.ErrorS(err, "Failed to allocate vgpu task", "pod", pod.Name)
+		return nil, err
+	}
+	if NodeLockEnable {
+		nodelock.UseClient(kubeClient)
+		err = nodelock.LockNode(gs.Name, DeviceName)
+		if err != nil {
+			return nil, errors.Errorf("node %s locked for %s hamivgpu lockname %s", gs.Name, pod.Name, err.Error())
+		}
+	}
+
+	annotations := make(map[string]string)
+	annotations[AssignedNodeAnnotations] = gs.Name
+	annotations[AssignedTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
+	annotations[AssignedIDsAnnotations] = encodePodDevices(device)
+	annotations[AssignedIDsToAllocateAnnotations] = annotations[AssignedIDsAnnotations]
+	annotations[DeviceBindPhase] = "allocating"
+	annotations[BindTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
+
+	// Update the in-memory device ledger without mutating shared pod annotations.
+	// Passing annotations directly avoids concurrent reads/writes on the shared Pod map.
+	gs.addToPodMap(annotations, pod)
+
+	// Return allocation annotations so predicates can carry the same values on
+	// the binding request. The apiserver merges Binding annotations into the Pod
+	// atomically with node assignment.
+	return &devices.DeviceReservation{
+		DeviceType:  DeviceName,
+		Annotations: annotations,
+	}, nil
+}
+
+// DeepCopy returns a deep copy of GPUDevices for use in dry-run simulation.
+func (gs *GPUDevices) DeepCopy() interface{} {
+	if gs == nil {
+		return nil
+	}
+	cp := &GPUDevices{
+		Name:    gs.Name,
+		Mode:    gs.Mode,
+		Score:   gs.Score,
+		Sharing: gs.Sharing,
+		Device:  make(map[int]*GPUDevice, len(gs.Device)),
+	}
+	for id, dev := range gs.Device {
+		newDev := &GPUDevice{
+			ID:       dev.ID,
+			Node:     dev.Node,
+			UUID:     dev.UUID,
+			Memory:   dev.Memory,
+			Number:   dev.Number,
+			Type:     dev.Type,
+			Health:   dev.Health,
+			UsedNum:  dev.UsedNum,
+			UsedMem:  dev.UsedMem,
+			UsedCore: dev.UsedCore,
+			MigUsage: deepCopyMigInUse(dev.MigUsage),
+			PodMap:   make(map[string]*GPUUsage, len(dev.PodMap)),
+		}
+		if len(dev.MigTemplate) > 0 {
+			newDev.MigTemplate = make([]deviceconfig.Geometry, len(dev.MigTemplate))
+			for i, g := range dev.MigTemplate {
+				ng := deviceconfig.Geometry{
+					Group:     g.Group,
+					Instances: make([]deviceconfig.MigTemplate, len(g.Instances)),
+				}
+				copy(ng.Instances, g.Instances)
+				newDev.MigTemplate[i] = ng
+			}
+		}
+		for uid, usage := range dev.PodMap {
+			u := *usage
+			newDev.PodMap[uid] = &u
+		}
+		cp.Device[id] = newDev
+	}
+	return cp
+}
