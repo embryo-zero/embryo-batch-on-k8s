@@ -17,7 +17,7 @@ require (
 	github.com/imdario/mergo v0.3.16
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/moby/sys/userns v0.1.0
-	github.com/onsi/ginkgo/v2 v2.32.0
+	github.com/onsi/ginkgo/v2 v2.34.0
 	github.com/onsi/gomega v1.42.1
 	github.com/opencontainers/cgroups v0.0.8
 	github.com/pkg/errors v0.9.1
